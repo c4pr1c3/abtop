@@ -230,6 +230,30 @@ pub struct SessionFile {
     pub cwd: String,
     #[serde(rename = "startedAt")]
     pub started_at: u64,
+    /// Process start time in clock ticks (matches `/proc/{pid}/stat` field 22,
+    /// `starttime`). Claude Code writes this as `procStart` to disambiguate PID
+    /// reuse, and its forks (clawgod, happy-coder) write the same field. abtop
+    /// uses it to confirm a live PID is the exact process that authored this
+    /// session file even when the binary is a runtime-wrapped fork whose argv
+    /// doesn't contain `claude`. Absent on older session files → None, in which
+    /// case detection falls back to the binary-name check. On disk it is a JSON
+    /// **string** (`"procStart":"394363811"`); a raw number is also accepted.
+    #[serde(default, rename = "procStart", deserialize_with = "deserialize_proc_start")]
+    pub proc_start: Option<u64>,
+}
+
+/// Deserialize `procStart`, tolerating the JSON-string form Claude Code writes
+/// (`"394363811"`) and a raw number. Absent, null, or unparseable → `None`.
+fn deserialize_proc_start<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(opt.and_then(|v| match v {
+        serde_json::Value::String(s) => s.parse().ok(),
+        serde_json::Value::Number(n) => n.as_u64(),
+        _ => None,
+    }))
 }
 
 impl SessionFile {
@@ -255,6 +279,26 @@ fn truncate_string(s: &mut String, max_bytes: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_file_parses_proc_start_as_string_or_number() {
+        // Claude Code writes procStart as a JSON string; tolerate a raw number.
+        let s = r#"{"pid":31000,"sessionId":"s","cwd":"/x","startedAt":1,"procStart":"394363811"}"#;
+        let sf: SessionFile = serde_json::from_str(s).unwrap();
+        assert_eq!(sf.proc_start, Some(394363811));
+
+        let s = r#"{"pid":31000,"sessionId":"s","cwd":"/x","startedAt":1,"procStart":394363811}"#;
+        let sf: SessionFile = serde_json::from_str(s).unwrap();
+        assert_eq!(sf.proc_start, Some(394363811));
+    }
+
+    #[test]
+    fn session_file_proc_start_defaults_absent() {
+        // Older session files without procStart still parse → None.
+        let s = r#"{"pid":31000,"sessionId":"s","cwd":"/x","startedAt":1}"#;
+        let sf: SessionFile = serde_json::from_str(s).unwrap();
+        assert_eq!(sf.proc_start, None);
+    }
 
     fn make_session(input: u64, output: u64, cache_read: u64, cache_create: u64) -> AgentSession {
         AgentSession {

@@ -3,13 +3,19 @@ use std::collections::HashMap;
 use std::fs;
 use std::process::Command;
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct ProcInfo {
     pub pid: u32,
     pub ppid: u32,
     pub rss_kb: u64,
     pub cpu_pct: f64,
     pub command: String,
+    /// Process start time in clock ticks (`/proc/{pid}/stat` field 22 on Linux).
+    /// Compared against a Claude session file's `procStart` to confirm a live
+    /// PID is the exact process that authored the session (and to rule out PID
+    /// reuse) when the binary is a runtime-wrapped fork. `0` on platforms
+    /// without a proc start time, where the procStart fallback is inert.
+    pub start_ticks: u64,
 }
 
 /// Resolve all symlinks in /proc/{pid}/fd, returning their targets.
@@ -105,6 +111,7 @@ pub fn get_process_info() -> HashMap<u32, ProcInfo> {
                 rss_kb,
                 cpu_pct,
                 command,
+                start_ticks: starttime,
             },
         );
     }
@@ -162,6 +169,7 @@ pub fn get_process_info() -> HashMap<u32, ProcInfo> {
                 rss_kb: proc_.memory() / 1024,
                 cpu_pct: proc_.cpu_usage() as f64,
                 command,
+                start_ticks: 0,
             },
         );
     }
@@ -196,6 +204,7 @@ pub fn get_process_info() -> HashMap<u32, ProcInfo> {
                             rss_kb: rss,
                             cpu_pct: cpu,
                             command,
+                            start_ticks: 0,
                         },
                     );
                 }
@@ -602,6 +611,7 @@ mod tests {
             rss_kb: 0,
             cpu_pct: 0.0,
             command: "x".to_string(),
+            start_ticks: 0,
         }
     }
 

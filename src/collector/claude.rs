@@ -250,6 +250,14 @@ impl ClaudeCollector {
     /// of abtop itself. Other users' non-interactive (`claude --print`)
     /// invocations are still surfaced — only abtop's own summary children
     /// are filtered out.
+    ///
+    /// Process-table-only (no session file in hand), so it can only match the
+    /// official `claude` binary name — runtime-wrapped forks like
+    /// clawgod/happy-coder are intentionally NOT matched here. That is fine:
+    /// this list only drives open-file-based config-root inference, and the
+    /// default root (`~/.claude`) plus configured roots are scanned
+    /// unconditionally in `collect_sessions`, so wrapper sessions are still
+    /// discovered and confirmed via `pid_is_claude_session` in `load_session`.
     fn find_claude_pids(process_info: &HashMap<u32, process::ProcInfo>, self_pid: u32) -> Vec<u32> {
         let mut pids = Vec::new();
         for (pid, info) in process_info {
@@ -339,10 +347,9 @@ impl ClaudeCollector {
             }
         }
 
-        let proc_cmd = process_info.get(&sf.pid).map(|p| p.command.as_str());
-        let pid_alive = proc_cmd
-            .map(|c| process::cmd_has_binary(c, "claude"))
-            .unwrap_or(false);
+        let pid_alive = process_info
+            .get(&sf.pid)
+            .is_some_and(|info| pid_is_claude_session(info, &sf));
 
         // Skip sessions whose PID is a descendant of abtop itself —
         // those are the `claude --print` summary children spawned by
@@ -1051,16 +1058,17 @@ fn build_discovery_context(
         if !seen_pids.insert(sf.pid) {
             continue;
         }
-        // Only count PIDs that are alive AND actually claude AND not
-        // descended from abtop itself. Stale `sessions/{PID}.json` files
+        // Only count PIDs that are alive AND actually a Claude session AND
+        // not descended from abtop itself. Stale `sessions/{PID}.json` files
         // (crashed sessions) and abtop's own `claude --print` summary
         // children would otherwise inflate `pids_per_cwd` and silently
         // suppress the /clear sid override for the real session sharing
-        // that cwd.
+        // that cwd. `pid_is_claude_session` accepts the official binary and
+        // runtime-wrapped forks (clawgod, happy-coder) verified via procStart.
         let Some(info) = process_info.get(&sf.pid) else {
             continue;
         };
-        if !process::cmd_has_binary(&info.command, "claude") {
+        if !pid_is_claude_session(info, &sf) {
             continue;
         }
         if process::is_descendant_of(sf.pid, self_pid, process_info) {
@@ -1170,6 +1178,27 @@ fn find_live_session_id(
     }
 
     best.map(|(_, sid)| sid)
+}
+
+/// True if `info` is the Claude Code process that authored `sf`.
+///
+/// The official Claude binary matches by name (`claude`, `claude.exe`, or the
+/// `<name>/versions/<file>` autoupdater layout, via `cmd_has_binary`).
+/// Runtime-wrapped forks and proxies — e.g. clawgod
+/// (`bun …/.clawgod/cli.cjs …`) and happy-coder (`node …/happy-coder … claude`)
+/// expose none of those argv shapes, so as a fallback we trust the `procStart`
+/// token Claude Code itself writes into the session file: it equals the process
+/// start time in clock ticks, which both confirms the PID is the original author
+/// of this session file and rules out PID reuse (a recycled PID would have a
+/// different start time). Config roots are only ever populated with session
+/// files by Claude Code, so a matching `procStart` is a strong, self-verifying
+/// ownership signal. Returns `false` when the PID is dead or when neither signal
+/// confirms it.
+fn pid_is_claude_session(info: &ProcInfo, sf: &SessionFile) -> bool {
+    if process::cmd_has_binary(&info.command, "claude") {
+        return true;
+    }
+    sf.proc_start.is_some_and(|start| start == info.start_ticks)
 }
 
 fn find_session_file_for_pid(sessions_dir: &Path, pid: u32) -> Option<PathBuf> {
@@ -2050,6 +2079,29 @@ mod tests {
         .unwrap();
     }
 
+    /// Like `write_session_file` but emits a `procStart` (as the JSON string
+    /// Claude Code itself writes), used to test detection of runtime-wrapped
+    /// forks whose argv contains no `claude` token.
+    fn write_session_file_with_proc_start(
+        path: &Path,
+        pid: u32,
+        session_id: &str,
+        cwd: &Path,
+        proc_start: u64,
+    ) {
+        std::fs::write(
+            path,
+            format!(
+                r#"{{"pid":{},"sessionId":"{}","cwd":"{}","startedAt":1774715116826,"procStart":"{}"}}"#,
+                pid,
+                session_id,
+                cwd.display(),
+                proc_start,
+            ),
+        )
+        .unwrap();
+    }
+
     fn write_transcript(projects: &Path, cwd: &Path, session_id: &str, prompt: &str) -> PathBuf {
         let transcript_dir = projects.join(encode_cwd_path(cwd.to_str().unwrap()));
         std::fs::create_dir_all(&transcript_dir).unwrap();
@@ -2068,6 +2120,16 @@ mod tests {
     }
 
     fn make_proc_info(pid: u32, command: &str) -> HashMap<u32, ProcInfo> {
+        make_proc_info_with_start(pid, command, 0)
+    }
+
+    /// Like `make_proc_info` but lets the caller set `start_ticks`, used to test
+    /// the procStart-based ownership check for runtime-wrapped forks.
+    fn make_proc_info_with_start(
+        pid: u32,
+        command: &str,
+        start_ticks: u64,
+    ) -> HashMap<u32, ProcInfo> {
         let mut process_info = HashMap::new();
         process_info.insert(
             pid,
@@ -2077,6 +2139,7 @@ mod tests {
                 rss_kb: 2048,
                 cpu_pct: 0.0,
                 command: command.to_string(),
+                start_ticks,
             },
         );
         process_info
@@ -2630,6 +2693,7 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
                 rss_kb: 1,
                 cpu_pct: 0.0,
                 command: "abtop".to_string(),
+                start_ticks: 0,
             },
         );
         process_info.insert(
@@ -2640,6 +2704,7 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
                 rss_kb: 1,
                 cpu_pct: 0.0,
                 command: "claude".to_string(),
+                start_ticks: 0,
             },
         );
         process_info.insert(
@@ -2650,6 +2715,7 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
                 rss_kb: 1,
                 cpu_pct: 0.0,
                 command: "claude --print summarize".to_string(),
+                start_ticks: 0,
             },
         );
         process_info.insert(
@@ -2660,6 +2726,7 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
                 rss_kb: 1,
                 cpu_pct: 0.0,
                 command: "codex".to_string(),
+                start_ticks: 0,
             },
         );
         process_info.insert(
@@ -2670,6 +2737,7 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
                 rss_kb: 1,
                 cpu_pct: 0.0,
                 command: "claude --print user-script".to_string(),
+                start_ticks: 0,
             },
         );
 
@@ -3719,6 +3787,7 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
                 rss_kb: 2048,
                 cpu_pct: 0.0,
                 command: "claude".to_string(),
+                start_ticks: 0,
             },
         );
         let mut collector = ClaudeCollector::new();
@@ -3790,6 +3859,7 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
                 rss_kb: 1024,
                 cpu_pct: 0.0,
                 command: "abtop".to_string(),
+                start_ticks: 0,
             },
         );
         process_info.insert(
@@ -3800,6 +3870,7 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
                 rss_kb: 512,
                 cpu_pct: 0.0,
                 command: "claude --print -".to_string(),
+                start_ticks: 0,
             },
         );
 
@@ -3867,6 +3938,7 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
                 rss_kb: 1024,
                 cpu_pct: 0.0,
                 command: "abtop".to_string(),
+                start_ticks: 0,
             },
         );
         process_info.insert(
@@ -3877,6 +3949,7 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
                 rss_kb: 512,
                 cpu_pct: 0.5,
                 command: "claude --print user-script".to_string(),
+                start_ticks: 0,
             },
         );
 
@@ -3992,5 +4065,169 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
             collector.transcript_cache.contains_key(new_sid),
             "new sid must be present in the cache after poll 2",
         );
+    }
+
+    /// Build a one-session fixture and run it through `load_session_paths`.
+    /// `command` is the live process cmdline, `proc_start` is written into the
+    /// session file (None omits the field), `start_ticks` is the process start
+    /// time — when they line up a runtime-wrapped fork is recognized even
+    /// though its argv contains no `claude` token.
+    fn load_session_fixture(
+        command: &str,
+        proc_start: Option<u64>,
+        start_ticks: u64,
+    ) -> Vec<AgentSession> {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join(".claude");
+        let sessions_dir = profile.join("sessions");
+        let projects = profile.join("projects");
+        let cwd = temp.path().join("repo");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let pid = 31000;
+        let sid = "clawgod-session";
+        let session_path = sessions_dir.join(format!("{}.json", pid));
+        match proc_start {
+            Some(ps) => write_session_file_with_proc_start(&session_path, pid, sid, &cwd, ps),
+            None => write_session_file(&session_path, pid, sid, &cwd),
+        }
+
+        // Minimal transcript so load_session has something to tail.
+        let transcript_dir = projects.join(encode_cwd_path(cwd.to_str().unwrap()));
+        std::fs::create_dir_all(&transcript_dir).unwrap();
+        std::fs::write(
+            transcript_dir.join(format!("{}.jsonl", sid)),
+            r#"{"type":"user","timestamp":"2026-03-28T15:00:00Z","message":{"role":"user","content":"hi"}}
+{"type":"assistant","timestamp":"2026-03-28T15:00:05Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"ok"}]}}
+"#,
+        )
+        .unwrap();
+
+        let config = ConfigDir::new(profile.clone());
+        let process_info = make_proc_info_with_start(pid, command, start_ticks);
+        let mut collector = ClaudeCollector::new();
+        collector.config_dirs = vec![config.clone()];
+
+        let session_paths = vec![(session_path, config)];
+        let ctx = build_discovery_context(&session_paths, &process_info, 0);
+        collector.load_session_paths(
+            &session_paths,
+            &process_info,
+            &HashMap::new(),
+            &HashMap::new(),
+            &ctx,
+        )
+    }
+
+    #[test]
+    fn test_pid_is_claude_session_official_binary() {
+        // Fast path: official claude binary matches by name regardless of procStart.
+        let info = ProcInfo {
+            pid: 1,
+            ppid: 0,
+            rss_kb: 0,
+            cpu_pct: 0.0,
+            command: "/usr/local/bin/claude".to_string(),
+            start_ticks: 0,
+        };
+        let sf = SessionFile {
+            pid: 1,
+            session_id: "s".to_string(),
+            cwd: "/x".to_string(),
+            started_at: 0,
+            proc_start: None,
+        };
+        assert!(pid_is_claude_session(&info, &sf));
+    }
+
+    #[test]
+    fn test_pid_is_claude_session_wrapped_fork_matches_proc_start() {
+        // clawgod launches as `bun .clawgod/cli.cjs` — no `claude` argv token.
+        let info = ProcInfo {
+            pid: 31000,
+            ppid: 1,
+            rss_kb: 136584,
+            cpu_pct: 0.0,
+            command: "/home/huangwei/.bun/bin/bun /home/huangwei/.clawgod/cli.cjs --dangerously-skip-permissions"
+                .to_string(),
+            start_ticks: 394363811,
+        };
+        let sf = SessionFile {
+            pid: 31000,
+            session_id: "s".to_string(),
+            cwd: "/home/huangwei/workspace/social-simulation/casevo-ng".to_string(),
+            started_at: 0,
+            proc_start: Some(394363811),
+        };
+        assert!(
+            pid_is_claude_session(&info, &sf),
+            "runtime-wrapped fork must be recognized via procStart == start_ticks",
+        );
+    }
+
+    #[test]
+    fn test_pid_is_claude_session_wrapped_fork_rejects_mismatch() {
+        // PID reuse: a recycled PID has a different start time → must not match.
+        let info = ProcInfo {
+            pid: 31000,
+            ppid: 1,
+            rss_kb: 0,
+            cpu_pct: 0.0,
+            command: "/home/huangwei/.bun/bin/bun /home/huangwei/.clawgod/cli.cjs".to_string(),
+            start_ticks: 999999,
+        };
+        let sf = SessionFile {
+            pid: 31000,
+            session_id: "s".to_string(),
+            cwd: "/x".to_string(),
+            started_at: 0,
+            proc_start: Some(394363811),
+        };
+        assert!(
+            !pid_is_claude_session(&info, &sf),
+            "mismatched procStart must not be recognized (PID reuse protection)",
+        );
+    }
+
+    #[test]
+    fn test_load_session_detects_runtime_wrapped_fork_via_proc_start() {
+        // Regression for the reported bug: Claude Code run through the clawgod
+        // fork on bun exposes argv[0]=bun, argv[1]=cli.cjs — neither is `claude`,
+        // so the binary-name check alone drops every session. With a matching
+        // procStart the session must load.
+        let wrapper_cmd = "/home/huangwei/.bun/bin/bun /home/huangwei/.clawgod/cli.cjs --dangerously-skip-permissions";
+        let sessions = load_session_fixture(wrapper_cmd, Some(394363811), 394363811);
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].pid, 31000);
+        assert_eq!(sessions[0].agent_cli, "claude");
+    }
+
+    #[test]
+    fn test_load_session_rejects_wrapped_fork_on_proc_start_mismatch() {
+        // Same wrapper command but the live process start time disagrees with
+        // the session file's procStart (PID was reused). The session must be
+        // dropped — confirming PID-reuse protection still works for wrappers.
+        let wrapper_cmd = "/home/huangwei/.bun/bin/bun /home/huangwei/.clawgod/cli.cjs";
+        let sessions = load_session_fixture(wrapper_cmd, Some(394363811), 999999);
+
+        assert!(
+            sessions.is_empty(),
+            "mismatched procStart wrapper session must be dropped",
+        );
+    }
+
+    #[test]
+    fn test_load_session_wrapper_without_proc_start_is_dropped() {
+        // A wrapper fork that does NOT write procStart and has no `claude` argv
+        // token cannot be confirmed — drop it rather than risk a false positive.
+        // (Older session files / unknown launchers.) Official claude without
+        // procStart still matches via the binary-name fast path (other tests).
+        let wrapper_cmd = "/home/huangwei/.bun/bin/bun /home/huangwei/.clawgod/cli.cjs";
+        let sessions = load_session_fixture(wrapper_cmd, None, 0);
+
+        assert!(sessions.is_empty());
     }
 }
