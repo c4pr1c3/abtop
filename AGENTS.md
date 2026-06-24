@@ -173,6 +173,12 @@ Rate limits extracted from `token_count` events:
 - Match live PIDs to DB sessions by process cwd. OpenCode does not expose a PID/session mapping, so when multiple DB rows share one cwd, only live PIDs should be assigned and older rows should not be shown as live duplicates.
 - OpenCode contributes session/token/project/port data, but not quota data. Quota remains Claude + Codex only.
 
+### kimi-code sessions: `~/.kimi/sessions/<md5(cwd)>/<uuid>/`
+- Discover running `kimi-code` processes via shared `ps` data (the `kimi-cli` runtime rewrites argv[0] to `kimi-code` via setproctitle; match the first token precisely).
+- Link a live PID to its session via `/proc/{pid}/cwd` → `md5(cwd)` → session dir; the newest `<uuid>/` subdir by mtime is the active session. kimi creates the session dir on the first user message, so a process at the welcome prompt has no session yet and is skipped until one exists.
+- Tail `wire.jsonl`: each `message.type == "StatusUpdate"` carries an authoritative `context_usage`, `max_context_tokens`, and a `token_usage` breakdown (`input_other` / `output` / `input_cache_read` / `input_cache_creation`). `context.jsonl` provides `assistant.tool_calls` (current task, tool timeline, file-access audit) and user/assistant chat. `state.json` provides `custom_title` (session title — no summarizer needed).
+- kimi contributes session/token/context/project/port data, but not quota data (managed OAuth; no local rate-limit telemetry). Quota remains Claude + Codex only.
+
 ### 5. Subagents: `~/.claude/projects/{path}/{sessionId}/subagents/`
 - `agent-{hash}.jsonl` — same JSONL format as main transcript
 - `agent-{hash}.meta.json` — `{ "agentType": "general-purpose", "description": "..." }`
@@ -350,6 +356,7 @@ cargo clippy                   # Lint
 - Cost estimation
 - Remote/SSH monitoring
 - Notifications/alerts
+- Per-agent rate-limit/quota for OpenCode and kimi-code (no reliable local telemetry; quota stays Claude + Codex only)
 
 ## tmux Integration
 
