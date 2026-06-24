@@ -1,38 +1,60 @@
 //! Collector for **kimi-code** sessions (launched via the `kimi` CLI).
 //!
-//! kimi-code stores sessions under `~/.kimi/sessions/<md5(cwd)>/<session_uuid>/`,
-//! each holding `context.jsonl` (conversation), `wire.jsonl` (raw API wire log)
-//! and `state.json` (session state). A running `kimi` process rewrites its
-//! argv[0] to `kimi-code` (via setproctitle), so we discover processes by that
-//! token and link each to its session through `/proc/{pid}/cwd` → `md5(cwd)`.
+//! kimi-code stores sessions under
+//! `~/.kimi-code/sessions/wd_<base>_<hash>/session_<uuid>/`, each holding
+//! `agents/main/wire.jsonl` (the full event stream: tokens, chat, tool calls)
+//! and `state.json` (title + timestamps). The config root keeps a
+//! `session_index.jsonl` listing every `{sessionId, sessionDir, workDir}` —
+//! that index is the authoritative discovery source (kimi's old `<md5(cwd)>`
+//! layout was retired when it migrated `~/.kimi` → `~/.kimi-code`).
 //!
-//! Telemetry is richer than Claude Code's: `wire.jsonl` emits a `StatusUpdate`
-//! per LLM step carrying an authoritative `context_usage` and a full
-//! `token_usage` breakdown, and `state.json` carries the session title — so no
-//! external summarizer is needed. kimi exposes no rate-limit telemetry, so it
-//! contributes nothing to the quota panel (like OpenCode).
+//! Discovery is **index-driven**, not process-cwd-driven: every `kimi-code`
+//! process `chdir`s to the config root, so `/proc/{pid}/cwd` can never yield a
+//! project hash. Instead, each live `kimi-code` PID is attributed to a session
+//! by walking its ancestor shell chain and matching the shell's cwd (the
+//! directory kimi was launched from) against the session's `workDir`. A shared
+//! server daemon (`server/lock` → pid) is the global "kimi is running" gate;
+//! per-session exit detection stays best-effort (no PID file is written).
+//!
+//! Telemetry comes from `wire.jsonl`:
+//! - `usage.record` — per-turn token breakdown (`inputOther` / `output` /
+//!   `inputCacheRead` / `inputCacheCreation`, camelCase) + `model` + `time` (ms).
+//!   kimi emits no context-window field, so context % is derived
+//!   (last-turn input / hardcoded 262144 window) like the Claude collector.
+//! - `context.append_message` — user/assistant chat turns.
+//! - `context.append_loop_event` (`tool.call` / `tool.result` / `content.part`
+//!   / `step.*`) — tool calls (name + args), streaming assistant text, steps.
+//!
+//! kimi exposes no rate-limit telemetry (managed OAuth), so it contributes
+//! nothing to the quota panel (like OpenCode).
 
 use super::process;
 use crate::model::{
-    AgentSession, ChatMessage, ChatRole, ChildProcess, FileAccess, FileOp, SessionStatus,
-    ToolCall, MAX_CHAT_MESSAGES, MAX_FILE_ACCESSES,
+    AgentSession, ChatMessage, ChatRole, ChildProcess, FileAccess, FileOp, SessionStatus, ToolCall,
+    MAX_CHAT_MESSAGES, MAX_FILE_ACCESSES,
 };
-use md5::{Digest, Md5};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Maximum tool-call timeline / chat entries kept per session to bound memory.
+/// Maximum tool-call / chat / file-access entries kept per session to bound memory.
 const MAX_TOOL_CALLS: usize = 500;
+/// Hardcoded context window for the kimi-code model (no field is emitted).
+const KIMI_CONTEXT_WINDOW: u64 = 262_144;
+/// Secondary liveness window: a session also shows if its wire log was touched
+/// this recently (the primary signal is attribution to a live PID).
+const SESSION_FRESH_SECS: u64 = 300;
+/// Working/Thinking vs Waiting freshness threshold (matches other collectors).
+const ACTIVITY_FRESH_SECS: u64 = 30;
 
 pub struct KimiCollector {
-    /// kimi-code config root (default `~/.kimi`).
+    /// kimi-code config root (default `~/.kimi-code`).
     config_root: PathBuf,
-    /// Per-session-uuid incremental parse cache.
+    /// Per-session incremental parse cache.
     cache: HashMap<String, KimiCache>,
 }
 
@@ -44,35 +66,71 @@ impl KimiCollector {
         }
     }
 
-    fn sessions_dir(&self) -> PathBuf {
-        self.config_root.join("sessions")
-    }
-
     fn collect_sessions(&mut self, shared: &super::SharedProcessData) -> Vec<AgentSession> {
         if !is_kimi_root(&self.config_root) {
             return vec![];
         }
 
         let self_pid = std::process::id();
-        let mut sessions = Vec::new();
-        let model_default = read_kimi_model(&self.config_root);
+        let entries = read_session_index(&self.config_root);
 
-        for pid in Self::find_kimi_pids(&shared.process_info, self_pid) {
-            // Welcome-screen state: process alive but no session dir yet
-            // (kimi creates the session on the first user message). Skip
-            // gracefully — no row until a session exists.
-            let Some(cwd) = process_cwd(pid) else {
+        // Global "kimi is running" gate: the shared server daemon is alive, or
+        // at least one kimi-code process (server/TUI) is running. If kimi is
+        // fully stopped, show nothing (sessions are not live).
+        let server_pid = read_server_lock_pid(&self.config_root);
+        let live_pids = Self::find_kimi_pids(&shared.process_info, self_pid);
+        let kimi_running = server_pid.is_some_and(|p| shared.process_info.contains_key(&p))
+            || !live_pids.is_empty();
+        if !kimi_running {
+            return vec![];
+        }
+
+        // Attribute each live kimi-code PID to a session by matching an
+        // ancestor shell's cwd (kimi's launch directory) to a session workDir.
+        // The PID's own cwd is skipped — kimi always chdir's to the config root.
+        let mut pid_by_workdir: HashMap<String, u32> = HashMap::new();
+        for &pid in &live_pids {
+            for cwd in ancestor_workdirs(pid, &shared.process_info) {
+                pid_by_workdir.entry(cwd).or_insert(pid);
+            }
+        }
+
+        let model_default = read_kimi_model(&self.config_root);
+        let now = SystemTime::now();
+        let mut sessions = Vec::new();
+
+        for entry in &entries {
+            if !entry.session_dir.is_dir() {
                 continue;
-            };
-            let hash = md5_hex(&cwd);
-            let Some(session_dir) = newest_session_dir(&self.sessions_dir(), &hash) else {
+            }
+            let wire_path = entry
+                .session_dir
+                .join("agents")
+                .join("main")
+                .join("wire.jsonl");
+            let fresh = file_age_secs(&wire_path, now) < SESSION_FRESH_SECS;
+            let attributed =
+                !entry.work_dir.is_empty() && pid_by_workdir.contains_key(&entry.work_dir);
+            // Primary signal: attributed to a live PID. Fallback: recently active.
+            if !attributed && !fresh {
                 continue;
+            }
+
+            let attached_pid = if !entry.work_dir.is_empty() {
+                pid_by_workdir
+                    .get(&entry.work_dir)
+                    .copied()
+                    .or(server_pid)
+                    .unwrap_or(0)
+            } else {
+                server_pid.unwrap_or(0)
             };
 
             if let Some(session) = self.load_session(
-                pid,
-                &cwd,
-                &session_dir,
+                &entry.session_id,
+                &entry.work_dir,
+                &entry.session_dir,
+                attached_pid,
                 &model_default,
                 shared,
             ) {
@@ -80,9 +138,8 @@ impl KimiCollector {
             }
         }
 
-        // Drop cache entries for sessions no longer live.
-        let live: std::collections::HashSet<&str> =
-            sessions.iter().map(|s| s.session_id.as_str()).collect();
+        // Drop cache entries for sessions no longer shown.
+        let live: HashSet<&str> = sessions.iter().map(|s| s.session_id.as_str()).collect();
         self.cache.retain(|sid, _| live.contains(sid.as_str()));
 
         sessions.sort_by_key(|s| std::cmp::Reverse(s.started_at));
@@ -90,12 +147,9 @@ impl KimiCollector {
     }
 
     /// Live `kimi-code` processes that are not descendants of abtop itself.
-    /// kimi-cli rewrites argv[0] to `kimi-code`, so we match the first token's
-    /// basename precisely (avoids matching `grep kimi-code` etc.).
-    fn find_kimi_pids(
-        process_info: &HashMap<u32, process::ProcInfo>,
-        self_pid: u32,
-    ) -> Vec<u32> {
+    /// kimi-cli rewrites argv[0] to `kimi-code` (setproctitle), so we match the
+    /// first token's basename precisely (avoids matching `grep kimi-code` etc.).
+    fn find_kimi_pids(process_info: &HashMap<u32, process::ProcInfo>, self_pid: u32) -> Vec<u32> {
         process_info
             .iter()
             .filter(|(pid, info)| {
@@ -108,24 +162,21 @@ impl KimiCollector {
 
     fn load_session(
         &mut self,
-        pid: u32,
-        cwd: &str,
+        session_id: &str,
+        work_dir: &str,
         session_dir: &Path,
+        pid: u32,
         model_default: &str,
         shared: &super::SharedProcessData,
     ) -> Option<AgentSession> {
-        let session_id = session_dir
-            .file_name()
-            .and_then(|n| n.to_str())?
-            .to_string();
+        let session_id = session_id.to_string();
 
-        let wire_path = session_dir.join("wire.jsonl");
-        let ctx_path = session_dir.join("context.jsonl");
+        let wire_path = session_dir.join("agents").join("main").join("wire.jsonl");
         let state_path = session_dir.join("state.json");
 
         let cache = self.cache.entry(session_id.clone()).or_default();
 
-        // --- wire.jsonl: authoritative context% + tokens + window + plan_mode ---
+        // --- wire.jsonl: tokens + context + chat + tool calls (single pass) ---
         if wire_path.exists() {
             let identity = file_identity(&wire_path);
             let reset = cache.wire_identity != identity;
@@ -143,85 +194,66 @@ impl KimiCollector {
                 cache.total_output += delta.output;
                 cache.total_cache_read += delta.cache_read;
                 cache.total_cache_create += delta.cache_create;
-                if delta.saw_status {
-                    cache.context_percent = delta.context_percent;
+                if delta.saw_usage {
                     cache.context_tokens = delta.context_tokens;
-                    cache.max_context_tokens = delta.max_context_tokens;
-                    cache.plan_mode = delta.plan_mode;
-                    cache.last_activity = delta.last_activity;
                     cache.token_history.extend(delta.token_history);
                     if cache.token_history.len() > 10_000 {
                         let extra = cache.token_history.len() - 10_000;
                         cache.token_history.drain(0..extra);
                     }
-                    cache.context_history.extend(delta.context_history);
+                    cache.context_history.push(delta.context_tokens);
                     if cache.context_history.len() > 10_000 {
                         let extra = cache.context_history.len() - 10_000;
                         cache.context_history.drain(0..extra);
                     }
                 }
+                if let Some(m) = &delta.model {
+                    cache.model = m.clone();
+                }
+                if let Some(t) = delta.last_activity {
+                    cache.last_activity =
+                        Some(cache.last_activity.map(|prev| prev.max(t)).unwrap_or(t));
+                }
+                cache.turn_count += delta.turn_count;
+                if !delta.current_task.is_empty() {
+                    cache.current_task = delta.current_task;
+                }
+                cache
+                    .tool_calls
+                    .extend(delta.tool_calls.into_iter().take(MAX_TOOL_CALLS));
+                if cache.tool_calls.len() > MAX_TOOL_CALLS {
+                    let extra = cache.tool_calls.len() - MAX_TOOL_CALLS;
+                    cache.tool_calls.drain(0..extra);
+                }
+                cache.file_accesses.extend(delta.file_accesses);
+                if cache.file_accesses.len() > MAX_FILE_ACCESSES {
+                    let extra = cache.file_accesses.len() - MAX_FILE_ACCESSES;
+                    cache.file_accesses.drain(0..extra);
+                }
+                cache.chat_messages.extend(delta.chat_messages);
+                if cache.chat_messages.len() > MAX_CHAT_MESSAGES {
+                    let extra = cache.chat_messages.len() - MAX_CHAT_MESSAGES;
+                    cache.chat_messages.drain(0..extra);
+                }
+                if cache.initial_prompt.is_empty() {
+                    cache.initial_prompt = delta.initial_prompt;
+                }
+                if cache.first_assistant_text.is_empty() {
+                    cache.first_assistant_text = delta.first_assistant_text;
+                }
             }
         }
 
-        // --- context.jsonl: tool_calls, chat, current_task, file accesses ---
-        if ctx_path.exists() {
-            let identity = file_identity(&ctx_path);
-            let reset = cache.ctx_identity != identity;
-            let from = if reset { 0 } else { cache.ctx_offset };
-            let delta = parse_context(&ctx_path, from);
-            if reset {
-                cache.ctx_offset = 0;
-                cache.ctx_identity = identity;
-                cache.turn_count = 0;
-                cache.current_task.clear();
-                cache.tool_calls.clear();
-                cache.chat_messages.clear();
-                cache.file_accesses.clear();
-                cache.initial_prompt.clear();
-                cache.first_assistant_text.clear();
-            }
-            cache.ctx_offset = delta.new_offset;
-            cache.ctx_identity = identity;
-            cache.turn_count += delta.turn_count;
-            if !delta.current_task.is_empty() {
-                cache.current_task = delta.current_task;
-            } else if delta.turn_count > 0 {
-                // Latest assistant turn had no tool_use → clear stale task.
-                cache.current_task.clear();
-            }
-            cache
-                .tool_calls
-                .extend(delta.tool_calls.into_iter().take(MAX_TOOL_CALLS));
-            if cache.tool_calls.len() > MAX_TOOL_CALLS {
-                let extra = cache.tool_calls.len() - MAX_TOOL_CALLS;
-                cache.tool_calls.drain(0..extra);
-            }
-            cache.file_accesses.extend(delta.file_accesses);
-            if cache.file_accesses.len() > MAX_FILE_ACCESSES {
-                let extra = cache.file_accesses.len() - MAX_FILE_ACCESSES;
-                cache.file_accesses.drain(0..extra);
-            }
-            cache.chat_messages.extend(delta.chat_messages);
-            if cache.chat_messages.len() > MAX_CHAT_MESSAGES {
-                let extra = cache.chat_messages.len() - MAX_CHAT_MESSAGES;
-                cache.chat_messages.drain(0..extra);
-            }
-            if cache.initial_prompt.is_empty() {
-                cache.initial_prompt = delta.initial_prompt;
-            }
-            if cache.first_assistant_text.is_empty() {
-                cache.first_assistant_text = delta.first_assistant_text;
-            }
-        }
-
-        // --- state.json: title + plan_mode override ---
-        // state.json `custom_title` is the real session title (kimi generates
-        // it itself), so prefer it over the first-user-prompt fallback for the
-        // displayed session title — no external summarizer needed.
+        // --- state.json: title (kimi generates it; no summarizer needed) ---
+        // New schema: top-level `title` (+ `isCustomTitle`). The legacy
+        // `custom_title`/`plan_mode` fields are gone.
         let title = read_state_title(&state_path).unwrap_or_default();
-        if let Some(pm) = read_state_plan_mode(&state_path) {
-            cache.plan_mode = pm;
-        }
+
+        let model = if !cache.model.is_empty() {
+            cache.model.clone()
+        } else {
+            model_default.to_string()
+        };
 
         let proc = shared.process_info.get(&pid);
         let mem_mb = proc.map(|p| p.rss_kb / 1024).unwrap_or(0);
@@ -231,10 +263,11 @@ impl KimiCollector {
         let has_active_descendant =
             process::has_active_descendant(pid, &shared.children_map, &shared.process_info, 5.0);
         let now = SystemTime::now();
-        let fresh = cache
-            .last_activity
-            .map(|t| now.duration_since(t).map(|d| d.as_secs() < 30).unwrap_or(false))
-            .unwrap_or(false);
+        let fresh = cache.last_activity.is_some_and(|t| {
+            now.duration_since(t)
+                .map(|d| d.as_secs() < ACTIVITY_FRESH_SECS)
+                .unwrap_or(false)
+        });
         let status = if has_active_descendant || pending_tool {
             SessionStatus::Executing
         } else if fresh {
@@ -243,7 +276,7 @@ impl KimiCollector {
             SessionStatus::Waiting
         };
 
-        let project_name = process::last_path_segment(cwd)
+        let project_name = process::last_path_segment(work_dir)
             .unwrap_or("?")
             .to_string();
 
@@ -257,12 +290,8 @@ impl KimiCollector {
 
         // Child process tree (ports/memory) — reuses abtop's shared process data.
         let mut children = Vec::new();
-        let mut stack: Vec<u32> = shared
-            .children_map
-            .get(&pid)
-            .cloned()
-            .unwrap_or_default();
-        let mut visited = std::collections::HashSet::new();
+        let mut stack: Vec<u32> = shared.children_map.get(&pid).cloned().unwrap_or_default();
+        let mut visited = HashSet::new();
         while let Some(cpid) = stack.pop() {
             if !visited.insert(cpid) {
                 continue;
@@ -281,19 +310,25 @@ impl KimiCollector {
             }
         }
 
+        let context_percent = if KIMI_CONTEXT_WINDOW > 0 {
+            (cache.context_tokens as f64 / KIMI_CONTEXT_WINDOW as f64) * 100.0
+        } else {
+            0.0
+        };
+
         let started_at = wire_mtime_ms(&wire_path).unwrap_or(0);
 
         Some(AgentSession {
             agent_cli: "kimi",
             pid,
             session_id,
-            cwd: cwd.to_string(),
+            cwd: work_dir.to_string(),
             project_name,
             started_at,
             status,
-            model: model_default.to_string(),
+            model,
             effort: String::new(),
-            context_percent: cache.context_percent,
+            context_percent,
             total_input_tokens: cache.total_input,
             total_output_tokens: cache.total_output,
             total_cache_read: cache.total_cache_read,
@@ -308,7 +343,7 @@ impl KimiCollector {
             token_history: cache.token_history.clone(),
             context_history: cache.context_history.clone(),
             compaction_count: 0,
-            context_window: cache.max_context_tokens,
+            context_window: KIMI_CONTEXT_WINDOW,
             subagents: vec![],
             mem_file_count: 0,
             mem_line_count: 0,
@@ -342,55 +377,151 @@ impl super::AgentCollector for KimiCollector {
 }
 
 // ---------------------------------------------------------------------------
-// Incremental parse cache
+// Session index + server lock (discovery sources)
 // ---------------------------------------------------------------------------
 
-#[derive(Default)]
-struct KimiCache {
-    wire_offset: u64,
-    wire_identity: (u64, u64),
-    ctx_offset: u64,
-    ctx_identity: (u64, u64),
-    // telemetry (cumulative / latest from wire.jsonl StatusUpdate)
-    total_input: u64,
-    total_output: u64,
-    total_cache_read: u64,
-    total_cache_create: u64,
-    context_percent: f64,
-    context_tokens: u64,
-    max_context_tokens: u64,
-    plan_mode: bool,
-    last_activity: Option<SystemTime>,
-    token_history: Vec<u64>,
-    context_history: Vec<u64>,
-    // structural (from context.jsonl)
-    turn_count: u32,
-    current_task: String,
-    tool_calls: Vec<ToolCall>,
-    chat_messages: Vec<ChatMessage>,
-    file_accesses: Vec<FileAccess>,
-    initial_prompt: String,
-    first_assistant_text: String,
+/// One row of `~/.kimi-code/session_index.jsonl`.
+struct IndexEntry {
+    session_id: String,
+    session_dir: PathBuf,
+    work_dir: String,
 }
+
+/// Parse `session_index.jsonl` into session entries. Falls back to scanning
+/// `sessions/wd_*/session_*/` (and the older `ses_*`) dirs when the index is
+/// absent so discovery still works on partial installs.
+fn read_session_index(root: &Path) -> Vec<IndexEntry> {
+    let mut out = Vec::new();
+    let index_path = root.join("session_index.jsonl");
+    if let Ok(content) = fs::read_to_string(&index_path) {
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            let Some(session_dir) = v
+                .get("sessionDir")
+                .and_then(|x| x.as_str())
+                .map(PathBuf::from)
+            else {
+                continue;
+            };
+            let session_id = v
+                .get("sessionId")
+                .and_then(|x| x.as_str())
+                .or_else(|| session_dir.file_name().and_then(|n| n.to_str()))
+                .unwrap_or("")
+                .to_string();
+            let work_dir = v
+                .get("workDir")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            out.push(IndexEntry {
+                session_id,
+                session_dir,
+                work_dir,
+            });
+        }
+    }
+    if out.is_empty() {
+        if let Ok(workdir_entries) = fs::read_dir(root.join("sessions")) {
+            for wd in workdir_entries.flatten() {
+                let wd_path = wd.path();
+                if !wd_path.is_dir() {
+                    continue;
+                }
+                let Ok(session_entries) = fs::read_dir(&wd_path) else {
+                    continue;
+                };
+                // Newest session under this workdir by mtime.
+                let mut best: Option<(SystemTime, PathBuf)> = None;
+                for s in session_entries.flatten() {
+                    if s.file_type().map(|ft| ft.is_symlink()).unwrap_or(true) {
+                        continue;
+                    }
+                    let p = s.path();
+                    if !p.is_dir() {
+                        continue;
+                    }
+                    let mtime = s
+                        .metadata()
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .unwrap_or(UNIX_EPOCH);
+                    match &best {
+                        Some((b, _)) if &mtime <= b => {}
+                        _ => best = Some((mtime, p)),
+                    }
+                }
+                if let Some((_, p)) = best {
+                    let session_id = p
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("")
+                        .to_string();
+                    out.push(IndexEntry {
+                        session_id,
+                        session_dir: p,
+                        work_dir: String::new(),
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Read the shared kimi-code server PID from `server/lock` (`{"pid":N,...}`).
+fn read_server_lock_pid(root: &Path) -> Option<u32> {
+    let content = fs::read_to_string(root.join("server").join("lock")).ok()?;
+    let v: Value = serde_json::from_str(&content).ok()?;
+    v.get("pid")
+        .and_then(|x| x.as_u64())
+        .and_then(|n| u32::try_from(n).ok())
+}
+
+/// Walk the ancestor chain of `pid` (starting at its parent — the kimi process
+/// itself chdir's to the config root, so its own cwd is meaningless) and return
+/// each ancestor's cwd. The shell/pane cwd is kimi's launch directory, which
+/// equals the session `workDir`.
+fn ancestor_workdirs(pid: u32, process_info: &HashMap<u32, process::ProcInfo>) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(info) = process_info.get(&pid) else {
+        return out;
+    };
+    let mut cur = info.ppid;
+    let mut visited = HashSet::new();
+    while cur != 0 && visited.insert(cur) {
+        if let Some(cwd) = process_cwd(cur) {
+            out.push(cwd);
+        }
+        match process_info.get(&cur) {
+            Some(info) if info.ppid != 0 && info.ppid != cur => cur = info.ppid,
+            _ => break,
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// wire.jsonl parsing (usage.record + context.append_message + loop events)
+// ---------------------------------------------------------------------------
 
 struct WireDelta {
     new_offset: u64,
-    saw_status: bool,
-    context_percent: f64,
+    saw_usage: bool,
     context_tokens: u64,
-    max_context_tokens: u64,
-    plan_mode: bool,
+    model: Option<String>,
     last_activity: Option<SystemTime>,
     input: u64,
     output: u64,
     cache_read: u64,
     cache_create: u64,
     token_history: Vec<u64>,
-    context_history: Vec<u64>,
-}
-
-struct ContextDelta {
-    new_offset: u64,
     turn_count: u32,
     current_task: String,
     tool_calls: Vec<ToolCall>,
@@ -400,25 +531,25 @@ struct ContextDelta {
     first_assistant_text: String,
 }
 
-// ---------------------------------------------------------------------------
-// wire.jsonl parsing (StatusUpdate → tokens / context / window / plan_mode)
-// ---------------------------------------------------------------------------
-
 fn parse_wire(path: &Path, from_offset: u64) -> WireDelta {
     let mut delta = WireDelta {
         new_offset: from_offset,
-        saw_status: false,
-        context_percent: 0.0,
+        saw_usage: false,
         context_tokens: 0,
-        max_context_tokens: 0,
-        plan_mode: false,
+        model: None,
         last_activity: None,
         input: 0,
         output: 0,
         cache_read: 0,
         cache_create: 0,
         token_history: Vec::new(),
-        context_history: Vec::new(),
+        turn_count: 0,
+        current_task: String::new(),
+        tool_calls: Vec::new(),
+        chat_messages: Vec::new(),
+        file_accesses: Vec::new(),
+        initial_prompt: String::new(),
+        first_assistant_text: String::new(),
     };
 
     let file = match fs::File::open(path) {
@@ -442,9 +573,6 @@ fn parse_wire(path: &Path, from_offset: u64) -> WireDelta {
         let _ = reader.seek(SeekFrom::Start(from_offset));
     }
 
-    let mtime = fs::metadata(path)
-        .ok()
-        .and_then(|m| m.modified().ok());
     let mut bytes_read = from_offset;
     let mut line_buf = String::new();
     const MAX_LINE_BYTES: usize = 10 * 1024 * 1024;
@@ -468,59 +596,7 @@ fn parse_wire(path: &Path, from_offset: u64) -> WireDelta {
                 let parsed = serde_json::from_str::<Value>(line).ok();
                 bytes_read += n as u64;
                 if let Some(val) = parsed {
-                    let msg_type = val
-                        .get("message")
-                        .and_then(|m| m.get("type"))
-                        .and_then(|t| t.as_str());
-                    if msg_type == Some("StatusUpdate") {
-                        let payload = val.get("message").and_then(|m| m.get("payload"));
-                        if let Some(p) = payload {
-                            delta.saw_status = true;
-                            if let Some(u) = p.get("context_usage").and_then(|v| v.as_f64()) {
-                                delta.context_percent = u * 100.0;
-                            }
-                            delta.context_tokens =
-                                p.get("context_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                            delta.max_context_tokens =
-                                p.get("max_context_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                            delta.plan_mode =
-                                p.get("plan_mode").and_then(|v| v.as_bool()).unwrap_or(false);
-                            if let Some(tu) = p.get("token_usage") {
-                                let inp = tu
-                                    .get("input_other")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0);
-                                let out = tu.get("output").and_then(|v| v.as_u64()).unwrap_or(0);
-                                let cr = tu
-                                    .get("input_cache_read")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0);
-                                let cc = tu
-                                    .get("input_cache_creation")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0);
-                                delta.input += inp;
-                                delta.output += out;
-                                delta.cache_read += cr;
-                                delta.cache_create += cc;
-                                if delta.token_history.len() < 10_000 {
-                                    delta.token_history.push(inp + out + cr + cc);
-                                }
-                            }
-                            if delta.context_history.len() < 10_000 {
-                                delta.context_history.push(delta.context_tokens);
-                            }
-                        }
-                    }
-                    if let Some(ts) = val.get("timestamp").and_then(|v| v.as_f64()) {
-                        // timestamp is epoch seconds (float). Convert to SystemTime.
-                        let secs = ts.trunc();
-                        let nanos = ((ts - secs).abs() * 1_000_000_000.0) as u32;
-                        if secs >= 0.0 {
-                            delta.last_activity = SystemTime::UNIX_EPOCH
-                                .checked_add(std::time::Duration::new(secs as u64, nanos));
-                        }
-                    }
+                    handle_wire_event(&val, &mut delta);
                 }
                 if !has_newline {
                     // incomplete trailing line — defer to next poll.
@@ -532,244 +608,159 @@ fn parse_wire(path: &Path, from_offset: u64) -> WireDelta {
     }
 
     delta.new_offset = bytes_read;
-    // A file mtime is a reliable fallback if no StatusUpdate timestamp was seen.
-    if delta.last_activity.is_none() {
-        delta.last_activity = mtime;
-    }
     delta
 }
 
-// ---------------------------------------------------------------------------
-// context.jsonl parsing (tool_calls / chat / current_task / file accesses)
-// ---------------------------------------------------------------------------
-
-fn parse_context(path: &Path, from_offset: u64) -> ContextDelta {
-    let mut delta = ContextDelta {
-        new_offset: from_offset,
-        turn_count: 0,
-        current_task: String::new(),
-        tool_calls: Vec::new(),
-        chat_messages: Vec::new(),
-        file_accesses: Vec::new(),
-        initial_prompt: String::new(),
-        first_assistant_text: String::new(),
-    };
-
-    let file = match fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return delta,
-    };
-    let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
-    if file_len < from_offset {
-        delta.new_offset = 0;
-        return delta;
-    }
-    if file_len == from_offset {
-        delta.new_offset = file_len;
-        return delta;
+/// Dispatch one parsed wire.jsonl line into `delta`.
+fn handle_wire_event(val: &Value, delta: &mut WireDelta) {
+    // Top-level event time (epoch ms) on every event.
+    if let Some(t) = time_to_systemtime(val.get("time")) {
+        delta.last_activity = Some(delta.last_activity.map(|prev| prev.max(t)).unwrap_or(t));
     }
 
-    use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
-    let mut reader = BufReader::new(file);
-    if from_offset > 0 {
-        let _ = reader.seek(SeekFrom::Start(from_offset));
-    }
-
-    let mut bytes_read = from_offset;
-    let mut line_buf = String::new();
-    const MAX_LINE_BYTES: usize = 10 * 1024 * 1024;
-    loop {
-        line_buf.clear();
-        match reader
-            .by_ref()
-            .take(MAX_LINE_BYTES as u64 + 1)
-            .read_line(&mut line_buf)
-        {
-            Ok(0) => break,
-            Ok(n) => {
-                let has_newline = line_buf.ends_with('\n');
-                let line = line_buf.trim();
-                if line.is_empty() {
-                    if has_newline {
-                        bytes_read += n as u64;
-                    }
-                    continue;
+    let event_type = val.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    match event_type {
+        "usage.record" => {
+            delta.saw_usage = true;
+            if let Some(u) = val.get("usage") {
+                let inp = u.get("inputOther").and_then(|v| v.as_u64()).unwrap_or(0);
+                let out = u.get("output").and_then(|v| v.as_u64()).unwrap_or(0);
+                let cr = u
+                    .get("inputCacheRead")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let cc = u
+                    .get("inputCacheCreation")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                delta.input += inp;
+                delta.output += out;
+                delta.cache_read += cr;
+                delta.cache_create += cc;
+                // Context tokens ≈ this turn's input side (mirrors the Claude
+                // collector's input + cache_read accounting).
+                delta.context_tokens = inp + cr + cc;
+                if delta.token_history.len() < 10_000 {
+                    delta.token_history.push(inp + out + cr + cc);
                 }
-                let parsed = serde_json::from_str::<Value>(line).ok();
-                bytes_read += n as u64;
-                if let Some(val) = parsed {
-                    let role = val.get("role").and_then(|r| r.as_str()).unwrap_or("");
-                    match role {
-                        "assistant" => {
-                            delta.turn_count += 1;
-                            delta.current_task.clear();
-                            let assistant_text = extract_text(&val);
-                            if delta.first_assistant_text.is_empty() && !assistant_text.is_empty() {
-                                delta.first_assistant_text = truncate(&assistant_text, 200);
-                            }
-                            if !assistant_text.is_empty() {
-                                push_chat(
-                                    &mut delta.chat_messages,
-                                    ChatRole::Assistant,
-                                    assistant_text,
-                                );
-                            }
-                            if let Some(calls) =
-                                val.get("tool_calls").and_then(|c| c.as_array())
-                            {
-                                for call in calls {
-                                    let function =
-                                        call.get("function").or_else(|| call.get("function"));
-                                    let Some(function) = function else { continue };
-                                    let name = function
-                                        .get("name")
-                                        .and_then(|n| n.as_str())
-                                        .unwrap_or("?");
-                                    let args_str = function
-                                        .get("arguments")
-                                        .and_then(|a| a.as_str())
-                                        .unwrap_or("");
-                                    let (arg, file_path) = parse_tool_args(name, args_str);
-                                    delta.current_task =
-                                        format!("{} {}", name, truncate(&arg, 40));
-                                    if delta.tool_calls.len() < MAX_TOOL_CALLS {
-                                        delta.tool_calls.push(ToolCall {
-                                            name: name.to_string(),
-                                            arg: truncate(&arg, 40),
-                                            duration_ms: 0,
-                                        });
-                                    }
-                                    if let (Some(op), Some(fp)) = (file_op_for(name), file_path) {
-                                        delta.file_accesses.push(FileAccess {
-                                            path: fp,
-                                            operation: op,
-                                            turn_index: delta.turn_count,
-                                        });
-                                    }
+            }
+            if let Some(m) = val.get("model").and_then(|m| m.as_str()) {
+                if !m.is_empty() {
+                    delta.model = Some(m.to_string());
+                }
+            }
+        }
+        "context.append_message" => {
+            let Some(msg) = val.get("message") else {
+                return;
+            };
+            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+            let text = extract_text_from_content(msg.get("content"));
+            match role {
+                "assistant" => {
+                    delta.turn_count += 1;
+                    if delta.first_assistant_text.is_empty() && !text.is_empty() {
+                        delta.first_assistant_text = truncate(&text, 200);
+                    }
+                    if !text.is_empty() {
+                        push_chat(&mut delta.chat_messages, ChatRole::Assistant, text);
+                    }
+                }
+                "user" => {
+                    if delta.initial_prompt.is_empty() && !text.is_empty() {
+                        delta.initial_prompt = truncate(&clean_prompt(&text), 50);
+                    }
+                    if !text.is_empty() {
+                        push_chat(&mut delta.chat_messages, ChatRole::User, text);
+                    }
+                }
+                _ => {}
+            }
+        }
+        "context.append_loop_event" => {
+            let Some(ev) = val.get("event") else {
+                return;
+            };
+            match ev.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+                "tool.call" => {
+                    let name = ev.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+                    let args = ev.get("args").unwrap_or(&Value::Null);
+                    let (arg, file_path) = parse_tool_args(name, args);
+                    delta.current_task = format!("{} {}", name, truncate(&arg, 40));
+                    if delta.tool_calls.len() < MAX_TOOL_CALLS {
+                        delta.tool_calls.push(ToolCall {
+                            name: name.to_string(),
+                            arg: truncate(&arg, 40),
+                            duration_ms: 0,
+                        });
+                    }
+                    if let (Some(op), Some(fp)) = (file_op_for(name), file_path) {
+                        delta.file_accesses.push(FileAccess {
+                            path: fp,
+                            operation: op,
+                            turn_index: delta.turn_count,
+                        });
+                    }
+                }
+                "content.part" if delta.first_assistant_text.is_empty() => {
+                    // Streaming assistant text — a fallback first-assistant
+                    // snapshot when append_message carried no text.
+                    if let Some(part) = ev.get("part") {
+                        if part.get("type").and_then(|t| t.as_str()) == Some("text") {
+                            if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
+                                let cleaned = super::sanitize_terminal_text(t);
+                                if !cleaned.trim().is_empty() {
+                                    delta.first_assistant_text = truncate(&cleaned, 200);
                                 }
                             }
                         }
-                        "user" => {
-                            let user_text = extract_text(&val);
-                            if delta.initial_prompt.is_empty() && !user_text.is_empty() {
-                                delta.initial_prompt = truncate(&clean_prompt(&user_text), 50);
-                            }
-                            if !user_text.is_empty() {
-                                push_chat(&mut delta.chat_messages, ChatRole::User, user_text);
-                            }
-                        }
-                        _ => {}
                     }
                 }
-                if !has_newline {
-                    break;
-                }
-            }
-            Err(_) => break,
-        }
-    }
-
-    delta.new_offset = bytes_read;
-    delta
-}
-
-/// Extract concatenated text content from a context.jsonl message.
-/// `content` may be a string or an array of `{type,text}` / `{type,think}` blocks.
-fn extract_text(msg: &Value) -> String {
-    let raw = match msg.get("content") {
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Array(arr)) => arr
-            .iter()
-            .filter_map(|block| {
-                let t = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                if t == "text" || t == "think" {
-                    block.get("text").and_then(|x| x.as_str()).map(String::from)
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" "),
-        _ => String::new(),
-    };
-    let cleaned: String = raw
-        .lines()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty() && !l.starts_with("```"))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let terminal_safe = super::sanitize_terminal_text(&cleaned);
-    truncate(&super::redact_secrets(&terminal_safe), 500)
-}
-
-/// Parse a tool's arguments JSON string into a short display arg and an
-/// optional file path (for the file-access audit).
-fn parse_tool_args(name: &str, args_json: &str) -> (String, Option<String>) {
-    let val: Value = match serde_json::from_str(args_json) {
-        Ok(v) => v,
-        Err(_) => return (String::new(), None),
-    };
-    let path = val.get("path").and_then(|p| p.as_str()).map(String::from);
-    match name {
-        "Shell" => {
-            let cmd = val.get("command").and_then(|c| c.as_str()).unwrap_or("");
-            let first = cmd.lines().next().unwrap_or(cmd);
-            (
-                super::redact_secrets(&truncate(first, 40)),
-                None,
-            )
-        }
-        "WriteFile" | "StrReplaceFile" | "ReadFile" | "ReadMediaFile" => {
-            let p = path.clone().unwrap_or_default();
-            (shorten_path(&p), path)
-        }
-        _ => {
-            if let Some(s) = val.get("command").and_then(|c| c.as_str()) {
-                (truncate(s.lines().next().unwrap_or(s), 40), None)
-            } else if let Some(p) = path.as_deref() {
-                (shorten_path(p), path.clone())
-            } else {
-                // Fall back to the first string value in the object.
-                let first = val
-                    .as_object()
-                    .and_then(|o| {
-                        o.values().find_map(|v| v.as_str()).map(|s| s.to_string())
-                    })
-                    .unwrap_or_default();
-                (truncate(&first, 40), None)
+                _ => {}
             }
         }
+        "turn.prompt" if delta.initial_prompt.is_empty() => {
+            let Some(arr) = val.get("input").and_then(|i| i.as_array()) else {
+                return;
+            };
+            let text: String = arr
+                .iter()
+                .filter_map(|b| {
+                    if b.get("type").and_then(|t| t.as_str()) == Some("text") {
+                        b.get("text").and_then(|t| t.as_str()).map(String::from)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            if !text.trim().is_empty() {
+                delta.initial_prompt = truncate(&clean_prompt(&text), 50);
+            }
+        }
+        _ => {}
     }
 }
 
-fn file_op_for(tool: &str) -> Option<FileOp> {
-    match tool {
-        "ReadFile" | "ReadMediaFile" => Some(FileOp::Read),
-        "WriteFile" => Some(FileOp::Write),
-        "StrReplaceFile" => Some(FileOp::Edit),
-        _ => None,
-    }
-}
-
-fn push_chat(messages: &mut Vec<ChatMessage>, role: ChatRole, text: String) {
-    if text.is_empty() {
-        return;
-    }
-    messages.push(ChatMessage { role, text });
-    if messages.len() > MAX_CHAT_MESSAGES {
-        let extra = messages.len() - MAX_CHAT_MESSAGES;
-        messages.drain(0..extra);
-    }
+/// Convert a wire `time` field (epoch milliseconds, number or string) to SystemTime.
+fn time_to_systemtime(v: Option<&Value>) -> Option<SystemTime> {
+    let ms = v
+        .and_then(|x| x.as_u64().or_else(|| x.as_f64().map(|f| f as u64)))
+        .or_else(|| {
+            v.and_then(|x| x.as_str())
+                .and_then(|s| s.parse::<u64>().ok())
+        })?;
+    UNIX_EPOCH.checked_add(std::time::Duration::from_millis(ms))
 }
 
 // ---------------------------------------------------------------------------
-// state.json (title + plan_mode) and config.toml (model)
+// state.json (title) and config.toml (model)
 // ---------------------------------------------------------------------------
 
 fn read_state_title(state_path: &Path) -> Option<String> {
     let val: Value = serde_json::from_str(&fs::read_to_string(state_path).ok()?).ok()?;
     let title = val
-        .get("custom_title")
+        .get("title")
         .and_then(|t| t.as_str())
         .unwrap_or("")
         .trim();
@@ -780,12 +771,7 @@ fn read_state_title(state_path: &Path) -> Option<String> {
     }
 }
 
-fn read_state_plan_mode(state_path: &Path) -> Option<bool> {
-    let val: Value = serde_json::from_str(&fs::read_to_string(state_path).ok()?).ok()?;
-    val.get("plan_mode").and_then(|p| p.as_bool())
-}
-
-/// Read the configured model's display name from `~/.kimi/config.toml`.
+/// Read the configured model's display name from `~/.kimi-code/config.toml`.
 /// Hand-scanned (abtop has no TOML dep): resolves `default_model` → its
 /// `[models."<id>"] display_name`. Falls back to the model id, then "kimi-code".
 fn read_kimi_model(config_root: &Path) -> String {
@@ -842,7 +828,10 @@ fn read_kimi_model(config_root: &Path) -> String {
 // helpers
 // ---------------------------------------------------------------------------
 
-/// Default kimi-code config root: `$KIMI_CONFIG_DIR` if set, else `~/.kimi`.
+/// Default kimi-code config root: `$KIMI_CONFIG_DIR` if set, else prefer
+/// `~/.kimi-code` (the post-migration root), falling back to the legacy
+/// `~/.kimi` only if `.kimi-code` is absent. Among valid candidates, prefer the
+/// one that ships `session_index.jsonl`.
 fn kimi_config_root() -> PathBuf {
     if let Ok(dir) = std::env::var("KIMI_CONFIG_DIR") {
         let p = PathBuf::from(dir);
@@ -850,43 +839,34 @@ fn kimi_config_root() -> PathBuf {
             return p;
         }
     }
-    dirs::home_dir().unwrap_or_default().join(".kimi")
+    let home = dirs::home_dir().unwrap_or_default();
+    let candidates = [home.join(".kimi-code"), home.join(".kimi")];
+    let mut best: Option<(u8, PathBuf)> = None;
+    for c in candidates {
+        if is_kimi_root(&c) {
+            let score = u8::from(c.join("session_index.jsonl").is_file());
+            match &best {
+                Some((s, _)) if *s >= score => {}
+                _ => best = Some((score, c)),
+            }
+        }
+    }
+    best.map(|(_, p)| p)
+        .unwrap_or_else(|| home.join(".kimi-code"))
 }
 
 fn is_kimi_root(path: &Path) -> bool {
     path.is_dir() && path.join("sessions").is_dir()
 }
 
-fn md5_hex(s: &str) -> String {
-    let mut hasher = Md5::new();
-    hasher.update(s.as_bytes());
-    format!("{:x}", hasher.finalize())
-}
-
-/// Newest session-uuid subdirectory under `sessions/<hash>/` by modification time.
-fn newest_session_dir(sessions_root: &Path, hash: &str) -> Option<PathBuf> {
-    let dir = sessions_root.join(hash);
-    let entries = fs::read_dir(&dir).ok()?;
-    let mut best: Option<(SystemTime, PathBuf)> = None;
-    for entry in entries.flatten() {
-        if entry.file_type().map(|ft| ft.is_symlink()).unwrap_or(true) {
-            continue;
-        }
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let mtime = entry
-            .metadata()
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .unwrap_or(UNIX_EPOCH);
-        match &best {
-            Some((b, _)) if &mtime <= b => {}
-            _ => best = Some((mtime, path)),
-        }
-    }
-    best.map(|(_, p)| p)
+/// Age of a file's mtime in seconds (`u64::MAX` if missing/unreadable).
+fn file_age_secs(path: &Path, now: SystemTime) -> u64 {
+    fs::metadata(path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| now.duration_since(t).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(u64::MAX)
 }
 
 #[cfg(target_os = "linux")]
@@ -946,6 +926,94 @@ fn file_identity(path: &Path) -> (u64, u64) {
         .unwrap_or((0, 0))
 }
 
+/// Extract concatenated text content from a `context.append_message` content
+/// field — a string or an array of `{type,text}` / `{type,think}` blocks.
+fn extract_text_from_content(content: Option<&Value>) -> String {
+    let raw = match content {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|block| {
+                let t = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                if t == "text" || t == "think" {
+                    block.get("text").and_then(|x| x.as_str()).map(String::from)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => String::new(),
+    };
+    let cleaned: String = raw
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.starts_with("```"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let terminal_safe = super::sanitize_terminal_text(&cleaned);
+    truncate(&super::redact_secrets(&terminal_safe), 500)
+}
+
+/// Parse a tool's arguments object into a short display arg and an optional
+/// file path (for the file-access audit). `args` is a JSON object (kimi's
+/// `tool.call` event stores it as an object, not a JSON string).
+fn parse_tool_args(name: &str, args: &Value) -> (String, Option<String>) {
+    let path = args
+        .get("path")
+        .and_then(|p| p.as_str())
+        .or_else(|| args.get("file_path").and_then(|p| p.as_str()))
+        .or_else(|| args.get("filePath").and_then(|p| p.as_str()))
+        .map(String::from);
+    match name {
+        "Shell" => {
+            let cmd = args.get("command").and_then(|c| c.as_str()).unwrap_or("");
+            (
+                super::redact_secrets(&truncate(cmd.lines().next().unwrap_or(cmd), 40)),
+                None,
+            )
+        }
+        "WriteFile" | "StrReplaceFile" | "ReadFile" | "ReadMediaFile" | "Edit" | "Write"
+        | "Read" => {
+            let p = path.clone().unwrap_or_default();
+            (shorten_path(&p), path)
+        }
+        _ => {
+            if let Some(s) = args.get("command").and_then(|c| c.as_str()) {
+                (truncate(s.lines().next().unwrap_or(s), 40), None)
+            } else if let Some(p) = path.as_deref() {
+                (shorten_path(p), path.clone())
+            } else {
+                let first = args
+                    .as_object()
+                    .and_then(|o| o.values().find_map(|v| v.as_str()).map(String::from))
+                    .unwrap_or_default();
+                (truncate(&first, 40), None)
+            }
+        }
+    }
+}
+
+fn file_op_for(tool: &str) -> Option<FileOp> {
+    match tool {
+        "ReadFile" | "ReadMediaFile" | "Read" => Some(FileOp::Read),
+        "WriteFile" | "Write" => Some(FileOp::Write),
+        "StrReplaceFile" | "Edit" => Some(FileOp::Edit),
+        _ => None,
+    }
+}
+
+fn push_chat(messages: &mut Vec<ChatMessage>, role: ChatRole, text: String) {
+    if text.is_empty() {
+        return;
+    }
+    messages.push(ChatMessage { role, text });
+    if messages.len() > MAX_CHAT_MESSAGES {
+        let extra = messages.len() - MAX_CHAT_MESSAGES;
+        messages.drain(0..extra);
+    }
+}
+
 fn shorten_path(path: &str) -> String {
     let parts: Vec<&str> = path.rsplit('/').collect();
     if parts.len() <= 2 {
@@ -975,57 +1043,70 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// incremental parse cache
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct KimiCache {
+    wire_offset: u64,
+    wire_identity: (u64, u64),
+    // telemetry (cumulative / latest from usage.record)
+    total_input: u64,
+    total_output: u64,
+    total_cache_read: u64,
+    total_cache_create: u64,
+    context_tokens: u64,
+    model: String,
+    last_activity: Option<SystemTime>,
+    token_history: Vec<u64>,
+    context_history: Vec<u64>,
+    // structural (from context.append_message / loop events)
+    turn_count: u32,
+    current_task: String,
+    tool_calls: Vec<ToolCall>,
+    chat_messages: Vec<ChatMessage>,
+    file_accesses: Vec<FileAccess>,
+    initial_prompt: String,
+    first_assistant_text: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn md5_hashing_matches_kimi_session_layout() {
-        // Verified against this machine: kimi names session dirs md5(cwd).
-        assert_eq!(
-            md5_hex("/home/huangwei/workspace/playground/Auto-claude-code-research-in-sleep"),
-            "7f406012a8bda4d83cbe521fb8598eec"
-        );
-        assert_eq!(
-            md5_hex("/tmp"),
-            "d42b9c57d24cf5db3bd8d332dc35437f"
-        );
-    }
-
-    #[test]
-    fn wire_parses_status_update_into_tokens_and_context() {
+    fn wire_parses_usage_record_into_tokens_and_derived_context() {
         let tmp = tempfile::tempdir().unwrap();
         let wire = tmp.path().join("wire.jsonl");
         std::fs::write(
             &wire,
             r#"{"type":"metadata","protocol_version":"1.10"}
-{"timestamp":1780132708.65,"message":{"type":"StatusUpdate","payload":{"context_usage":0.5,"context_tokens":131072,"max_context_tokens":262144,"token_usage":{"input_other":100,"output":10,"input_cache_read":200,"input_cache_creation":5},"message_id":"m1","plan_mode":false,"mcp_status":null}}}
-{"timestamp":1780132709.0,"message":{"type":"StatusUpdate","payload":{"context_usage":0.25,"context_tokens":65536,"max_context_tokens":262144,"token_usage":{"input_other":50,"output":5,"input_cache_read":0,"input_cache_creation":0},"message_id":"m2","plan_mode":true,"mcp_status":null}}}
+{"type":"usage.record","model":"kimi-code/kimi-for-coding","usage":{"inputOther":3822,"output":858,"inputCacheRead":14336,"inputCacheCreation":0},"usageScope":"turn","time":1781485995669}
+{"type":"usage.record","model":"kimi-code/kimi-for-coding","usage":{"inputOther":100,"output":10,"inputCacheRead":0,"inputCacheCreation":0},"usageScope":"turn","time":1781485996000}
 "#,
         )
         .unwrap();
 
         let delta = parse_wire(&wire, 0);
-        assert!(delta.saw_status);
-        // latest wins for context/window/plan_mode
-        assert_eq!(delta.context_percent, 25.0);
-        assert_eq!(delta.context_tokens, 65536);
-        assert_eq!(delta.max_context_tokens, 262144);
-        assert!(delta.plan_mode);
+        assert!(delta.saw_usage);
         // cumulative token sums
-        assert_eq!(delta.input, 150);
-        assert_eq!(delta.output, 15);
-        assert_eq!(delta.cache_read, 200);
-        assert_eq!(delta.cache_create, 5);
+        assert_eq!(delta.input, 3922);
+        assert_eq!(delta.output, 868);
+        assert_eq!(delta.cache_read, 14336);
+        assert_eq!(delta.cache_create, 0);
+        // latest turn's input side → derived context tokens (100+0+0)
+        assert_eq!(delta.context_tokens, 100);
+        assert_eq!(delta.model.as_deref(), Some("kimi-code/kimi-for-coding"));
         assert!(delta.last_activity.is_some());
+        assert_eq!(delta.token_history.len(), 2);
     }
 
     #[test]
     fn wire_incremental_offset_only_parses_new_bytes() {
         let tmp = tempfile::tempdir().unwrap();
         let wire = tmp.path().join("wire.jsonl");
-        let first =
-            r#"{"timestamp":1780132708.0,"message":{"type":"StatusUpdate","payload":{"context_usage":0.1,"context_tokens":100,"max_context_tokens":262144,"token_usage":{"input_other":10,"output":1,"input_cache_read":0,"input_cache_creation":0}}}}
+        let first = r#"{"type":"usage.record","model":"kimi-code/kimi-for-coding","usage":{"inputOther":10,"output":1,"inputCacheRead":0,"inputCacheCreation":0},"usageScope":"turn","time":1781485995000}
 "#;
         std::fs::write(&wire, first).unwrap();
         let off = std::fs::metadata(&wire).unwrap().len();
@@ -1034,7 +1115,7 @@ mod tests {
         assert_eq!(d1.input, 10);
         assert_eq!(d1.new_offset, off);
 
-        // append a second status; incremental parse must only see the new one.
+        // append a second record; incremental parse must only see the new one.
         use std::io::Write;
         {
             let mut f = std::fs::OpenOptions::new()
@@ -1042,7 +1123,7 @@ mod tests {
                 .open(&wire)
                 .unwrap();
             f.write_all(
-                br#"{"timestamp":1780132709.0,"message":{"type":"StatusUpdate","payload":{"context_usage":0.2,"context_tokens":200,"max_context_tokens":262144,"token_usage":{"input_other":20,"output":2,"input_cache_read":0,"input_cache_creation":0}}}}
+                br#"{"type":"usage.record","model":"kimi-code/kimi-for-coding","usage":{"inputOther":20,"output":2,"inputCacheRead":0,"inputCacheCreation":0},"usageScope":"turn","time":1781485996000}
 "#,
             )
             .unwrap();
@@ -1050,97 +1131,120 @@ mod tests {
 
         let d2 = parse_wire(&wire, off);
         assert_eq!(d2.input, 20); // only the appended line
-        assert_eq!(d2.context_tokens, 200);
+        assert_eq!(d2.context_tokens, 20);
     }
 
     #[test]
-    fn context_parses_assistant_tool_calls_and_user_prompt() {
+    fn wire_context_append_message_parses_chat_and_initial_prompt() {
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = tmp.path().join("context.jsonl");
+        let wire = tmp.path().join("wire.jsonl");
         std::fs::write(
-            &ctx,
-            r#"{"role":"_system_prompt","content":"system"}
-{"role":"user","content":"organize a git commit"}
-{"role":"assistant","content":[{"type":"text","text":"done"}]}
-{"role":"assistant","content":[{"type":"think","think":"planning"}],"tool_calls":[{"type":"function","id":"t1","function":{"name":"Shell","arguments":"{\"command\":\"cd /x && git status\"}"}}]}
+            &wire,
+            r#"{"type":"context.append_message","message":{"role":"user","content":[{"type":"text","text":"organize a git commit"}]}}
+{"type":"context.append_message","message":{"role":"assistant","content":[{"type":"text","text":"done"}]}}
 "#,
         )
         .unwrap();
 
-        let d = parse_context(&ctx, 0);
-        assert_eq!(d.turn_count, 2);
-        assert_eq!(d.current_task, "Shell cd /x && git status");
-        assert_eq!(d.tool_calls.len(), 1);
-        assert_eq!(d.tool_calls[0].name, "Shell");
+        let d = parse_wire(&wire, 0);
+        assert_eq!(d.turn_count, 1);
         assert_eq!(d.initial_prompt, "organize a git commit");
         assert!(!d.first_assistant_text.is_empty());
-        // user + 2 assistant text turns → at least 2 chat messages
-        assert!(d.chat_messages.len() >= 2);
+        // user + assistant → 2 chat messages
+        assert_eq!(d.chat_messages.len(), 2);
     }
 
     #[test]
-    fn context_file_accesses_captured_for_file_tools() {
+    fn wire_loop_event_tool_call_parses_tools_and_file_access() {
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = tmp.path().join("context.jsonl");
+        let wire = tmp.path().join("wire.jsonl");
         std::fs::write(
-            &ctx,
-            r#"{"role":"assistant","content":[],"tool_calls":[{"type":"function","id":"t1","function":{"name":"WriteFile","arguments":"{\"path\":\"/repo/src/main.rs\"}"}}]}
+            &wire,
+            r#"{"type":"context.append_loop_event","event":{"type":"tool.call","name":"Shell","args":{"command":"cd /x && git status"},"toolCallId":"t1"},"time":1781485995000}
+{"type":"context.append_loop_event","event":{"type":"tool.call","name":"WriteFile","args":{"path":"/repo/src/main.rs"},"toolCallId":"t2"},"time":1781485996000}
 "#,
         )
         .unwrap();
-        let d = parse_context(&ctx, 0);
+
+        let d = parse_wire(&wire, 0);
+        assert_eq!(d.tool_calls.len(), 2);
+        assert_eq!(d.tool_calls[0].name, "Shell");
+        assert_eq!(d.current_task, "WriteFile src/main.rs");
         assert_eq!(d.file_accesses.len(), 1);
         assert_eq!(d.file_accesses[0].path, "/repo/src/main.rs");
         assert_eq!(d.file_accesses[0].operation, FileOp::Write);
     }
 
     #[test]
-    fn state_title_and_plan_mode_parsed() {
+    fn state_title_parsed_from_new_schema() {
         let tmp = tempfile::tempdir().unwrap();
         let state = tmp.path().join("state.json");
         std::fs::write(
             &state,
-            r#"{"custom_title":"组织一波 git 提交","plan_mode":false,"todos":[]}"#,
+            r#"{"title":"组织一波 git 提交","isCustomTitle":false,"createdAt":"2026-06-24T01:59:44.115Z","updatedAt":"2026-06-24T02:00:38.951Z"}"#,
         )
         .unwrap();
-        assert_eq!(read_state_title(&state).as_deref(), Some("组织一波 git 提交"));
-        assert_eq!(read_state_plan_mode(&state), Some(false));
+        assert_eq!(
+            read_state_title(&state).as_deref(),
+            Some("组织一波 git 提交")
+        );
     }
 
     #[test]
-    fn config_model_display_name_resolved() {
+    fn config_root_prefers_kimi_code_over_legacy_kimi() {
+        // Both roots exist with sessions/; the one with session_index.jsonl wins.
         let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let new_root = home.join(".kimi-code");
+        let legacy = home.join(".kimi");
+        std::fs::create_dir_all(new_root.join("sessions")).unwrap();
+        std::fs::create_dir_all(legacy.join("sessions")).unwrap();
+        std::fs::write(new_root.join("session_index.jsonl"), "").unwrap();
+
+        std::env::set_var("HOME", home);
+        std::env::remove_var("KIMI_CONFIG_DIR");
+        let root = kimi_config_root();
+        std::env::remove_var("HOME");
+        assert_eq!(root, new_root);
+    }
+
+    #[test]
+    fn session_index_parsed_into_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("sessions")).unwrap();
         std::fs::write(
-            tmp.path().join("config.toml"),
-            r#"default_model = "kimi-code/kimi-for-coding"
-[models."kimi-code/kimi-for-coding"]
-display_name = "Kimi-k2.6"
-"#,
+            root.join("session_index.jsonl"),
+            "{\"sessionId\":\"session_abc\",\"sessionDir\":\"/home/u/.kimi-code/sessions/wd_abtop_a3e08d75b3cc/session_abc\",\"workDir\":\"/home/u/abtop\"}\n\
+             {\"sessionId\":\"session_def\",\"sessionDir\":\"/home/u/.kimi-code/sessions/wd_.kimi_9610029f55da/session_def\",\"workDir\":\"/home/u/.kimi\"}\n",
         )
         .unwrap();
-        assert_eq!(read_kimi_model(tmp.path()), "Kimi-k2.6");
+        let entries = read_session_index(root);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].session_id, "session_abc");
+        assert_eq!(entries[0].work_dir, "/home/u/abtop");
+        assert_eq!(entries[1].work_dir, "/home/u/.kimi");
     }
 
     #[test]
-    fn config_model_falls_back_to_id_without_display_name() {
+    fn server_lock_pid_parsed() {
         let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("server")).unwrap();
         std::fs::write(
-            tmp.path().join("config.toml"),
-            r#"default_model = "kimi-code/kimi-for-coding"
-[models."kimi-code/kimi-for-coding"]
-max_context_size = 262144
-"#,
+            root.join("server").join("lock"),
+            r#"{"pid":10452,"started_at":"2026-06-24T02:04:19.321Z","host":"127.0.0.1","port":58627}"#,
         )
         .unwrap();
-        assert_eq!(read_kimi_model(tmp.path()), "kimi-code/kimi-for-coding");
+        assert_eq!(read_server_lock_pid(root), Some(10452));
     }
 
     #[test]
-    fn welcome_screen_no_session_dir_is_skipped() {
-        // sessions/<hash>/ absent → newest_session_dir returns None → caller skips.
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("sessions");
-        std::fs::create_dir_all(&root).unwrap();
-        assert!(newest_session_dir(&root, "deadbeefdeadbeefdeadbeefdeadbeef").is_none());
+    fn time_to_systemtime_handles_ms_number_and_string() {
+        let n = serde_json::json!(1781485995669u64);
+        let s = serde_json::json!("1781485995669");
+        assert!(time_to_systemtime(Some(&n)).is_some());
+        assert_eq!(time_to_systemtime(Some(&n)), time_to_systemtime(Some(&s)));
+        assert!(time_to_systemtime(Some(&serde_json::json!("not-a-number"))).is_none());
     }
 }

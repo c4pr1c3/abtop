@@ -173,11 +173,34 @@ Rate limits extracted from `token_count` events:
 - Match live PIDs to DB sessions by process cwd. OpenCode does not expose a PID/session mapping, so when multiple DB rows share one cwd, only live PIDs should be assigned and older rows should not be shown as live duplicates.
 - OpenCode contributes session/token/project/port data, but not quota data. Quota remains Claude + Codex only.
 
-### kimi-code sessions: `~/.kimi/sessions/<md5(cwd)>/<uuid>/`
-- Discover running `kimi-code` processes via shared `ps` data (the `kimi-cli` runtime rewrites argv[0] to `kimi-code` via setproctitle; match the first token precisely).
-- Link a live PID to its session via `/proc/{pid}/cwd` → `md5(cwd)` → session dir; the newest `<uuid>/` subdir by mtime is the active session. kimi creates the session dir on the first user message, so a process at the welcome prompt has no session yet and is skipped until one exists.
-- Tail `wire.jsonl`: each `message.type == "StatusUpdate"` carries an authoritative `context_usage`, `max_context_tokens`, and a `token_usage` breakdown (`input_other` / `output` / `input_cache_read` / `input_cache_creation`). `context.jsonl` provides `assistant.tool_calls` (current task, tool timeline, file-access audit) and user/assistant chat. `state.json` provides `custom_title` (session title — no summarizer needed).
-- kimi contributes session/token/context/project/port data, but not quota data (managed OAuth; no local rate-limit telemetry). Quota remains Claude + Codex only.
+### kimi-code sessions: `~/.kimi-code/sessions/wd_<base>_<hash>/session_<uuid>/`
+kimi migrated its storage from `~/.kimi` to `~/.kimi-code` (an `.migrated-to-kimi-code`
+marker is left behind in the legacy root); the collector prefers `~/.kimi-code` and only
+falls back to `~/.kimi` if the new root is absent.
+- Discover sessions from `~/.kimi-code/session_index.jsonl` — one JSON object per line,
+  `{sessionId, sessionDir, workDir}`. This is the authoritative session list (kimi's old
+  `<md5(cwd)>` directory encoding was retired). A live `kimi-code` process is detected via
+  shared `ps` data (the `kimi-cli` runtime rewrites argv[0] to `kimi-code` via setproctitle;
+  match the first token precisely), but it is **not** linked via `/proc/{pid}/cwd` — every
+  kimi-code process chdir's to the config root, so its cwd is meaningless.
+- Liveness + PID attribution: kimi runs a client+server model with no per-session PID file.
+  The shared server daemon's PID lives in `server/lock` (`{"pid":N,...}`) and is the global
+  "kimi is running" gate. Each live `kimi-code` PID is attributed to a session by walking its
+  ancestor shell chain and matching the shell's cwd (kimi's launch directory) to a session
+  `workDir`. Exit detection is best-effort: a session with no live PID is also shown while its
+  wire log was touched within the last few minutes, then ages out.
+- Tail `agents/main/wire.jsonl` (there is no separate `context.jsonl` anymore):
+  - `usage.record` — per-turn tokens (`usage.inputOther` / `output` / `inputCacheRead` /
+    `inputCacheCreation`, camelCase), `model`, `time` (epoch ms). kimi emits **no**
+    context-window field, so context % is derived (last-turn input / hardcoded 262144 window),
+    mirroring the Claude collector's accounting.
+  - `context.append_message` — user/assistant chat turns (`message.role` / `message.content`).
+  - `context.append_loop_event` — `tool.call` (tool name + args → current task, tool timeline,
+    file-access audit), `tool.result`, `content.part` (streaming assistant text), `step.*`.
+- `state.json` provides `title` (+ `isCustomTitle`) for the session title — kimi generates it
+  itself, so no external summarizer is needed.
+- kimi contributes session/token/context/project/port data, but not quota data (managed OAuth;
+  no local rate-limit telemetry). Quota remains Claude + Codex only.
 
 ### 5. Subagents: `~/.claude/projects/{path}/{sessionId}/subagents/`
 - `agent-{hash}.jsonl` — same JSONL format as main transcript
