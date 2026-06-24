@@ -2,7 +2,9 @@
 
 AI agent monitor for your terminal. Like btop++, but for AI coding agents.
 
-Supports Claude Code, Codex CLI, and OpenCode sessions.
+Supports Claude Code, Codex CLI, OpenCode, and kimi-code sessions.
+
+**kimi-code is a first-class supported agent and an active focus of development.** It is discovered from `~/.kimi-code`, contributes session / token / context-window / task / project / port data, and is on equal footing with Claude Code, Codex CLI, and OpenCode (see §5).
 
 ## Language Policy
 
@@ -29,6 +31,7 @@ src/
 │   ├── claude.rs           # Claude Code: session discovery, transcript parsing
 │   ├── codex.rs            # Codex CLI: session discovery via ps+lsof, JSONL parsing
 │   ├── opencode.rs         # OpenCode: session discovery via ps + SQLite DB parsing
+│   ├── kimi.rs             # kimi-code: session_index.jsonl discovery + wire.jsonl tailing
 │   ├── process.rs          # Child process tree (ps) + open ports (lsof) + git stats
 │   └── rate_limit.rs       # Rate limit file reading (~/.claude/abtop-rate-limits.json)
 └── model/
@@ -173,7 +176,7 @@ Rate limits extracted from `token_count` events:
 - Match live PIDs to DB sessions by process cwd. OpenCode does not expose a PID/session mapping, so when multiple DB rows share one cwd, only live PIDs should be assigned and older rows should not be shown as live duplicates.
 - OpenCode contributes session/token/project/port data, but not quota data. Quota remains Claude + Codex only.
 
-### kimi-code sessions: `~/.kimi-code/sessions/wd_<base>_<hash>/session_<uuid>/`
+### 5. kimi-code sessions: `~/.kimi-code/sessions/wd_<base>_<hash>/session_<uuid>/`
 kimi migrated its storage from `~/.kimi` to `~/.kimi-code` (an `.migrated-to-kimi-code`
 marker is left behind in the legacy root); the collector prefers `~/.kimi-code` and only
 falls back to `~/.kimi` if the new root is absent.
@@ -202,11 +205,18 @@ falls back to `~/.kimi` if the new root is absent.
 - kimi contributes session/token/context/project/port data, but not quota data (managed OAuth;
   no local rate-limit telemetry). Quota remains Claude + Codex only.
 
-### 5. Subagents: `~/.claude/projects/{path}/{sessionId}/subagents/`
+**Known limitations of kimi support (all heuristic/derived):**
+- Context % is **derived** against a hardcoded 262,144-token window (`KIMI_CONTEXT_WINDOW`); kimi emits no context-window field. Same approach as the Claude collector.
+- **No git branch** — only added/modified counts are populated by the shared git pass; kimi has no transcript-level branch field, so the projects panel shows counts but no branch name.
+- **No Error/Done status** — only Executing / Thinking / Waiting are derived from activity.
+- **No rate-limit/quota telemetry** (managed OAuth) — quota stays Claude + Codex only.
+- **No subagents / memory** — kimi exposes no subagent tree or memory directory.
+
+### 6. Subagents: `~/.claude/projects/{path}/{sessionId}/subagents/`
 - `agent-{hash}.jsonl` — same JSONL format as main transcript
 - `agent-{hash}.meta.json` — `{ "agentType": "general-purpose", "description": "..." }`
 
-### 6. Process tree: `ps` + `lsof`
+### 7. Process tree: `ps` + `lsof`
 ```bash
 ps -eo pid,ppid,rss,%cpu,command    # All processes
 lsof -i -P -n -sTCP:LISTEN         # Open ports
@@ -214,16 +224,16 @@ lsof -i -P -n -sTCP:LISTEN         # Open ports
 - Build parent→children map from ppid
 - Map listening PID → parent agent PID → session
 
-### 7. Git status per project
+### 8. Git status per project
 ```bash
 git -C {cwd} status --porcelain     # added/modified file counts
 ```
 
-### 8. Memory status
+### 9. Memory status
 - Path: `~/.claude/projects/{encoded-path}/memory/`
 - Count files in directory + lines in `MEMORY.md`
 
-### 9. Rate limit (Claude Code)
+### 10. Rate limit (Claude Code)
 
 NOT in transcript JSONL. Collected via StatusLine mechanism.
 
@@ -243,7 +253,7 @@ File format read by abtop:
 - Account-level metric, shared across all sessions.
 - Show "—" when not configured or data unavailable.
 
-### 10. Other files
+### 11. Other files
 - `~/.claude/stats-cache.json` — daily aggregates. Only updated on `/stats`, NOT real-time.
 - `~/.claude/history.jsonl` — prompt history with sessionId.
 
@@ -287,6 +297,7 @@ Not provided in data files. Derive:
   - `claude-opus-4-6[1m]` → 1,000,000
   - `claude-sonnet-4-6` → 200,000
   - `claude-haiku-4-5` → 200,000
+  - kimi-code → 262,144 (hardcoded `KIMI_CONTEXT_WINDOW`; kimi emits no window field, so the same derivation applies — see §5)
 - **Current usage**: last `assistant` line's `input_tokens + cache_read_input_tokens`. `cache_creation_input_tokens` is intentionally excluded — on compaction turns the same tokens can be reported as both `cache_creation` *and* `cache_read`, and summing all three double-counts (#54). Matches Claude Code's own statusline and the Codex collector.
 - **Percentage**: current_usage / window_size * 100
 - **Warning**: yellow at 80%, red at 90%, ⚠ icon at 90%+
@@ -379,7 +390,7 @@ cargo clippy                   # Lint
 - Cost estimation
 - Remote/SSH monitoring
 - Notifications/alerts
-- Per-agent rate-limit/quota for OpenCode and kimi-code (no reliable local telemetry; quota stays Claude + Codex only)
+- Rate-limit/quota telemetry for OpenCode and kimi-code (both use managed OAuth / have no local account-level rate-limit source; the quota panel stays Claude + Codex only). This is a data limitation only — kimi-code and OpenCode are otherwise first-class supported agents.
 
 ## tmux Integration
 
