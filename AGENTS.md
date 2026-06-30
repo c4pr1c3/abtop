@@ -2,7 +2,7 @@
 
 AI agent monitor for your terminal. Like btop++, but for AI coding agents.
 
-Supports Claude Code, Codex CLI, OpenCode, and kimi-code sessions.
+Supports Claude Code, Codex CLI, OpenCode, kimi-code, and Hermes Agent sessions.
 
 **kimi-code is a first-class supported agent and an active focus of development.** It is discovered from `~/.kimi-code`, contributes session / token / context-window / task / project / port data, and is on equal footing with Claude Code, Codex CLI, and OpenCode (see §5).
 
@@ -32,6 +32,7 @@ src/
 │   ├── codex.rs            # Codex CLI: session discovery via ps+lsof, JSONL parsing
 │   ├── opencode.rs         # OpenCode: session discovery via ps + SQLite DB parsing
 │   ├── kimi.rs             # kimi-code: session_index.jsonl discovery + wire.jsonl tailing
+│   ├── hermes.rs           # Hermes Agent: ~/.hermes/state.db (SQLite) discovery + ps pairing
 │   ├── process.rs          # Child process tree (ps) + open ports (lsof) + git stats
 │   └── rate_limit.rs       # Rate limit file reading (~/.claude/abtop-rate-limits.json)
 └── model/
@@ -212,11 +213,50 @@ falls back to `~/.kimi` if the new root is absent.
 - **No rate-limit/quota telemetry** (managed OAuth) — quota stays Claude + Codex only.
 - **No subagents / memory** — kimi exposes no subagent tree or memory directory.
 
-### 6. Subagents: `~/.claude/projects/{path}/{sessionId}/subagents/`
+### 6. Hermes Agent sessions: `$HERMES_HOME/state.db` (default `~/.hermes`)
+Hermes Agent (NousResearch/hermes-agent) stores all session metadata, message history,
+and model config in a single SQLite database (WAL mode) at `$HERMES_HOME/state.db`
+(default `~/.hermes`; native Windows uses `%LOCALAPPDATA%\hermes`). This replaced an
+earlier per-session JSONL trajectory format. v1 monitors the default profile only.
+- Discover open CLI sessions from the `sessions` table
+  (`WHERE ended_at IS NULL AND source = 'cli'`) via `sqlite3 -readonly -json`
+  (WAL-safe concurrent read). Rows are cached and refreshed only on the slow tick
+  (~10s). Token counts (`input_tokens` / `output_tokens` / `cache_read_tokens` /
+  `cache_write_tokens`), `model`, `title`, `message_count`, and `started_at` are
+  first-class columns — no transcript parsing needed. A `last_active` subquery (max
+  `messages.timestamp`) drives recency; a `preview` subquery (first user message) is
+  the title fallback.
+- Liveness + PID attribution: the `sessions` table has **no `cwd`/`directory`
+  column**, so PIDs are paired to sessions by **recency**, not cwd. Live `hermes`
+  agent processes are found via shared `ps` data (the installer ships a `hermes`
+  shim; uv/python wrappers may show `python -m hermes`, so match either a first-token
+  basename hit or any command referencing `hermes`). The long-lived messaging gateway
+  daemon (`hermes gateway …`) is excluded. PIDs are ordered by RSS so the primary
+  process pairs first; subagents then surface as children. A paired PID contributes
+  cwd, memory, status, children, and ports.
+- Sessions with no paired PID are shown as `Unknown` only while recent
+  (`NO_PID_RECENCY_WINDOW_SECS`, 30 min) — hedges against PID-matcher gaps while
+  bounding stale/crashed sessions whose `ended_at` never got set.
+- Hermes contributes session/token/status/task/git/port data, but not quota data
+  (BYO provider; no local account-level rate-limit source). Quota remains Claude +
+  Codex only.
+
+**Known limitations of Hermes support (v1):**
+- **Default profile only** — `$HERMES_HOME` / `~/.hermes`. Multi-profile discovery
+  from live PIDs' `HERMES_HOME` environ is a future enhancement (mirror Claude's
+  `refresh_config_dirs`).
+- **No context-window %** — Hermes is multi-provider with no single window.
+- **No rate-limit/quota telemetry** (BYO provider) — quota stays Claude + Codex only.
+- **No subagents / memory / chat-tool-call enrichment** — data lives in the
+  `messages` table but is not parsed yet.
+- PID↔session pairing is by recency (no cwd column), so with multiple concurrent
+  sessions in one profile the exact pairing is best-effort.
+
+### 7. Subagents: `~/.claude/projects/{path}/{sessionId}/subagents/`
 - `agent-{hash}.jsonl` — same JSONL format as main transcript
 - `agent-{hash}.meta.json` — `{ "agentType": "general-purpose", "description": "..." }`
 
-### 7. Process tree: `ps` + `lsof`
+### 8. Process tree: `ps` + `lsof`
 ```bash
 ps -eo pid,ppid,rss,%cpu,command    # All processes
 lsof -i -P -n -sTCP:LISTEN         # Open ports
@@ -224,16 +264,16 @@ lsof -i -P -n -sTCP:LISTEN         # Open ports
 - Build parent→children map from ppid
 - Map listening PID → parent agent PID → session
 
-### 8. Git status per project
+### 9. Git status per project
 ```bash
 git -C {cwd} status --porcelain     # added/modified file counts
 ```
 
-### 9. Memory status
+### 10. Memory status
 - Path: `~/.claude/projects/{encoded-path}/memory/`
 - Count files in directory + lines in `MEMORY.md`
 
-### 10. Rate limit (Claude Code)
+### 11. Rate limit (Claude Code)
 
 NOT in transcript JSONL. Collected via StatusLine mechanism.
 
@@ -253,7 +293,7 @@ File format read by abtop:
 - Account-level metric, shared across all sessions.
 - Show "—" when not configured or data unavailable.
 
-### 11. Other files
+### 12. Other files
 - `~/.claude/stats-cache.json` — daily aggregates. Only updated on `/stats`, NOT real-time.
 - `~/.claude/history.jsonl` — prompt history with sessionId.
 
@@ -298,6 +338,7 @@ Not provided in data files. Derive:
   - `claude-sonnet-4-6` → 200,000
   - `claude-haiku-4-5` → 200,000
   - kimi-code → 262,144 (hardcoded `KIMI_CONTEXT_WINDOW`; kimi emits no window field, so the same derivation applies — see §5)
+  - Hermes → **not derived** (multi-provider; no single context window — see §6)
 - **Current usage**: last `assistant` line's `input_tokens + cache_read_input_tokens`. `cache_creation_input_tokens` is intentionally excluded — on compaction turns the same tokens can be reported as both `cache_creation` *and* `cache_read`, and summing all three double-counts (#54). Matches Claude Code's own statusline and the Codex collector.
 - **Percentage**: current_usage / window_size * 100
 - **Warning**: yellow at 80%, red at 90%, ⚠ icon at 90%+
@@ -390,7 +431,7 @@ cargo clippy                   # Lint
 - Cost estimation
 - Remote/SSH monitoring
 - Notifications/alerts
-- Rate-limit/quota telemetry for OpenCode and kimi-code (both use managed OAuth / have no local account-level rate-limit source; the quota panel stays Claude + Codex only). This is a data limitation only — kimi-code and OpenCode are otherwise first-class supported agents.
+- Rate-limit/quota telemetry for OpenCode, kimi-code, and Hermes Agent (all use managed OAuth / BYO providers with no local account-level rate-limit source; the quota panel stays Claude + Codex only). This is a data limitation only — kimi-code, OpenCode, and Hermes are otherwise first-class supported agents.
 
 ## tmux Integration
 

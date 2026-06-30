@@ -138,6 +138,7 @@ pub(crate) fn draw_sessions_panel_active(
             "codex" => (">CD", Color::Rgb(122, 157, 255)), // #7A9DFF periwinkle
             "opencode" => ("#OC", Color::Rgb(74, 222, 128)), // #4ADE80 emerald
             "kimi" => ("KIM", Color::Rgb(236, 72, 153)),   // #EC4899 magenta
+            "hermes" => ("HER", Color::Rgb(34, 211, 238)), // #22D3EE cyan
             other => {
                 let fallback: String = other.chars().take(3).collect::<String>().to_uppercase();
                 (
