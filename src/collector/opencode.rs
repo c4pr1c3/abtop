@@ -573,6 +573,7 @@ mod tests {
                 rss_kb: 1000,
                 cpu_pct: 0.0,
                 command: "/home/user/.opencode/bin/opencode".to_string(),
+                start_ticks: 0,
             },
         );
         info.insert(
@@ -583,6 +584,7 @@ mod tests {
                 rss_kb: 500,
                 cpu_pct: 0.0,
                 command: "grep opencode".to_string(),
+                start_ticks: 0,
             },
         );
         info.insert(
@@ -593,6 +595,7 @@ mod tests {
                 rss_kb: 800,
                 cpu_pct: 0.0,
                 command: "node /usr/bin/opencode run test".to_string(),
+                start_ticks: 0,
             },
         );
         let pids = OpenCodeCollector::find_opencode_pids(&info);

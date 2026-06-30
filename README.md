@@ -2,8 +2,8 @@
 
 **Like [btop](https://github.com/aristocratos/btop), but for your AI coding agents.**
 
-See every Claude Code, Codex CLI, and OpenCode session at a glance — token usage, context window %, rate limits, child processes, open ports, and more.
-Claude Code, Codex CLI, and OpenCode sessions are discovered from local process/file state, so multiple active profiles are supported across macOS, Linux, and Windows.
+See every Claude Code, Codex CLI, OpenCode, kimi-code, and Hermes Agent session at a glance — token usage, context window %, rate limits, child processes, open ports, and more.
+Claude Code, Codex CLI, OpenCode, kimi-code, and Hermes Agent sessions are discovered from local process/file state, so multiple active profiles are supported across macOS, Linux, and Windows.
 
 ![demo](https://raw.githubusercontent.com/graykode/abtop/main/assets/demo.gif)
 
@@ -73,20 +73,24 @@ tmux new -s work
 
 ## Supported Agents
 
-| Feature           | Claude Code | Codex CLI | OpenCode |
-| ----------------- | :---------: | :-------: | :------: |
-| Session Discovery |     ✅      |    ✅     |    ✅    |
-| Token Tracking    |     ✅      |    ✅     |    ✅    |
-| Context Window %  |     ✅      |    ✅     |    ❌    |
-| Status Detection  |     ✅      |    ✅     |    ✅    |
-| Current Task      |     ✅      |    ✅     |    ❌    |
-| Rate Limit        |     ✅      |    ✅     |    ❌    |
-| Git Status        |     ✅      |    ✅     |    ✅    |
-| Children / Ports  |     ✅      |    ✅     |    ✅    |
-| Subagents         |     ✅      |    ❌     |    ❌    |
-| Memory Status     |     ✅      |    ❌     |    ❌    |
+| Feature           | Claude Code | Codex CLI | OpenCode | kimi-code | Hermes |
+| ----------------- | :---------: | :-------: | :------: | :------: | :-----: |
+| Session Discovery |     ✅      |    ✅     |    ✅    |    ✅    |   ✅    |
+| Token Tracking    |     ✅      |    ✅     |    ✅    |    ✅    |   ✅    |
+| Context Window %  |     ✅      |    ✅     |    ❌    |    ✅    |   ❌    |
+| Status Detection  |     ✅      |    ✅     |    ✅    |    ✅    |   ✅    |
+| Current Task      |     ✅      |    ✅     |    ❌    |    ✅    |   ✅    |
+| Rate Limit        |     ✅      |    ✅     |    ❌    |    ❌    |   ❌    |
+| Git Status        |     ✅      |    ✅     |    ✅    |    ✅    |   ✅    |
+| Children / Ports  |     ✅      |    ✅     |    ✅    |    ✅    |   ✅    |
+| Subagents         |     ✅      |    ❌     |    ❌    |    ❌    |   ❌    |
+| Memory Status     |     ✅      |    ❌     |    ❌    |    ❌    |   ❌    |
 
 OpenCode support reads the local SQLite database at `~/.local/share/opencode/opencode.db` (also the default location on Windows; `%LOCALAPPDATA%\opencode` and `%APPDATA%\opencode` are probed as fallbacks) and requires `sqlite3` in `PATH` (on Windows: `winget install SQLite.SQLite`).
+
+kimi-code support reads `~/.kimi-code/session_index.jsonl` and tails each session's `agents/main/wire.jsonl`. It honors `$KIMI_CONFIG_DIR` and falls back to the legacy `~/.kimi` root. **kimi-code is a first-class supported agent and an active focus of development** — it contributes session, token, context-window, current-task, project, and port data. (Rate-limit/quota remains Claude + Codex only, since kimi uses managed OAuth with no local telemetry.)
+
+Hermes Agent support reads the local SQLite database at `$HERMES_HOME/state.db` (default `~/.hermes`) and requires `sqlite3` in `PATH`. Open CLI sessions are read from the `sessions` table (`ended_at IS NULL`, `source = 'cli'`) and paired with live `hermes` processes for cwd, status, and children/ports. It contributes session, token, status, current-task, git, and port data. (No context-window % or rate-limit column: Hermes is multi-provider with no single context window or managed quota.)
 
 ## Themes
 
