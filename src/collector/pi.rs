@@ -76,6 +76,14 @@ impl PiCollector {
         }
     }
 
+    #[cfg(test)]
+    fn with_sessions_root(root: PathBuf) -> Self {
+        Self {
+            sessions_root: root,
+            cache: HashMap::new(),
+        }
+    }
+
     fn collect_sessions(&mut self, shared: &super::SharedProcessData) -> Vec<AgentSession> {
         if !self.sessions_root.is_dir() {
             return vec![];
@@ -86,22 +94,61 @@ impl PiCollector {
         // Live Pi processes (for the transcript-only cwd fallback).
         let pi_pids = Self::find_pi_pids(&shared.process_info, self_pid);
 
+        let now = SystemTime::now();
+
         // Sidecar-attributed sessions: read active/*.json, verify liveness.
+        // Every sidecar file (live or stale) *claims* its sessionId so the
+        // transcript-only fallback below never re-adds the same session.
         let sidecars = read_active_sidecars(&self.sessions_root);
         let mut sessions = Vec::new();
         let mut live_sidecar_ids: HashSet<String> = HashSet::new();
+        let mut live_sidecar_cwds: HashSet<String> = HashSet::new();
+        let mut stale_sidecar_ids: HashSet<String> = HashSet::new();
+        let mut stale_sidecar_paths: Vec<PathBuf> = Vec::new();
 
         for sc in &sidecars {
-            let verified = verify_sidecar(sc, &shared.process_info);
+            // A sidecar claim is authoritative for its sessionId regardless of
+            // liveness — the fallback must never resurrect a session whose
+            // sidecar already owns it (this is what caused duplicate rows +
+            // wrong status when a workspace restarted with a new session/PID).
+            // Only a *verified* (PID-alive) sidecar yields a shown session.
+            let pid_alive = shared.process_info.contains_key(&sc.pid);
+            let verified = pid_alive && verify_sidecar(sc, &shared.process_info);
             if verified {
                 live_sidecar_ids.insert(sc.session_id.clone());
+                live_sidecar_cwds.insert(sc.cwd.clone());
+                if let Some(s) = self.load_session_from_sidecar(sc, true, shared) {
+                    sessions.push(s);
+                }
+                continue;
             }
-            if let Some(s) = self.load_session_from_sidecar(sc, verified, shared) {
-                sessions.push(s);
+            // Stale sidecar: the owning process is gone (or its PID was
+            // reused). Show it only while its transcript is still fresh — a
+            // recency-bounded Unknown window — then GC the stale file so a
+            // future restart in the same workspace can't resurrect the dead
+            // session on every tick.
+            stale_sidecar_ids.insert(sc.session_id.clone());
+            if file_age_secs(&PathBuf::from(&sc.session_file), now) < SESSION_FRESH_SECS {
+                if let Some(s) = self.load_session_from_sidecar(sc, false, shared) {
+                    sessions.push(s);
+                }
+            } else if !pid_alive {
+                // Definitively dead PID + stale transcript: drop the claim.
+                stale_sidecar_paths.push(
+                    self.sessions_root
+                        .join("active")
+                        .join(format!("{}.json", sc.pid)),
+                );
             }
         }
+        // GC stale sidecar files. The Pi monitor extension cannot reliably
+        // delete on crash (a SIGKILL fires no shutdown event), so abtop owns
+        // the cleanup per the sidecar contract.
+        for path in &stale_sidecar_paths {
+            let _ = fs::remove_file(path);
+        }
 
-        // Transcript-only fallback: sessions not already claimed by a sidecar,
+        // Transcript-only fallback: sessions not claimed by any sidecar,
         // matched to a live Pi process by cwd, or recently active.
         let mut pid_by_cwd: HashMap<String, u32> = HashMap::new();
         for &pid in &pi_pids {
@@ -109,19 +156,30 @@ impl PiCollector {
                 pid_by_cwd.entry(cwd).or_insert(pid);
             }
         }
-
-        let now = SystemTime::now();
+        // A single live Pi PID occupies one cwd at a time, and a workspace
+        // already served by a *live* sidecar is fully covered by it. So the
+        // fallback attributes at most the newest transcript per cwd, and never
+        // for a cwd owned by a verified sidecar — otherwise a prior session's
+        // transcript would be ghosted onto the new PID after a restart.
+        let mut attributed_cwds: HashSet<String> = HashSet::new();
         for path in discover_transcripts(&self.sessions_root) {
             let Some(header) = read_transcript_header(&path) else {
                 continue;
             };
-            if live_sidecar_ids.contains(header.session_id.as_str()) {
-                continue; // already handled from the sidecar
+            if live_sidecar_ids.contains(header.session_id.as_str())
+                || stale_sidecar_ids.contains(header.session_id.as_str())
+            {
+                continue; // already handled from the sidecar (live or stale)
             }
-            let attributed = !header.cwd.is_empty() && pid_by_cwd.contains_key(&header.cwd);
+            let attributed = !header.cwd.is_empty()
+                && pid_by_cwd.contains_key(&header.cwd)
+                && !live_sidecar_cwds.contains(&header.cwd);
             let fresh = file_age_secs(&path, now) < SESSION_FRESH_SECS;
             if !attributed && !fresh {
                 continue;
+            }
+            if attributed && !attributed_cwds.insert(header.cwd.clone()) {
+                continue; // older historical transcript in this cwd — skip
             }
             let pid = if attributed {
                 pid_by_cwd.get(&header.cwd).copied().unwrap_or(0)
@@ -1244,5 +1302,152 @@ mod tests {
     fn timestamp_ms_parses_iso8601() {
         assert_eq!(timestamp_ms(Some(&serde_json::json!("1970-01-01T00:00:00.000Z"))), Some(0));
         assert_eq!(timestamp_ms(Some(&serde_json::json!("1970-01-02T00:00:00.000Z"))), Some(86400000));
+    }
+
+    // ---- helpers for collector-level tests ----
+
+    fn empty_shared() -> crate::collector::SharedProcessData {
+        crate::collector::SharedProcessData {
+            process_info: HashMap::new(),
+            children_map: HashMap::new(),
+            ports: HashMap::new(),
+            slow_tick: true,
+            mcp_server_pids: HashSet::new(),
+            mcp_owned_rollouts: HashSet::new(),
+            mcp_suppress: true,
+            desktop_rollout_fd_map: HashMap::new(),
+        }
+    }
+
+    fn write_transcript(dir: &std::path::Path, sid: &str, cwd: &str) -> std::path::PathBuf {
+        // Transcripts live under an encoded-cwd project subdirectory.
+        let proj_dir = dir.join("--repo--abtop--");
+        std::fs::create_dir_all(&proj_dir).unwrap();
+        let path = proj_dir.join(format!("{}.jsonl", sid));
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"type\":\"session\",\"version\":3,\"id\":\"{}\",\"timestamp\":\"2026-08-18T13:27:26.247Z\",\"cwd\":\"{}\"}}\n",
+                sid, cwd
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    fn set_mtime_old(path: &std::path::Path) {
+        use std::fs::FileTimes;
+        let f = std::fs::File::open(path).unwrap();
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        f.set_times(FileTimes::new().set_modified(past)).unwrap();
+    }
+
+    fn write_sidecar(active: &std::path::Path, pid: u32, sid: &str, cwd: &str, session_file: &str) {
+        std::fs::write(
+            active.join(format!("{}.json", pid)),
+            format!(
+                "{{\"pid\":{},\"agent\":\"my-pi-agent\",\"version\":\"0.84.2\",\"sessionId\":\"{}\",\"sessionFile\":\"{}\",\"cwd\":\"{}\",\"startedAt\":1787059700000,\"contextWindow\":262144,\"contextPercent\":10.0}}",
+                pid, sid, session_file, cwd
+            ),
+        )
+        .unwrap();
+    }
+
+    // A fully-exited session: dead PID + stale transcript -> the stale sidecar
+    // must be GC'd and no Unknown ghost row shown.
+    #[test]
+    fn stale_sidecar_with_stale_transcript_is_gced_and_hidden() {
+        let tmp = tempfile::tempdir().unwrap();
+        let active = tmp.path().join("active");
+        std::fs::create_dir_all(&active).unwrap();
+        let transcript = write_transcript(tmp.path(), "old-sid", "/repo/abtop");
+        set_mtime_old(&transcript);
+        write_sidecar(&active, 9999, "old-sid", "/repo/abtop", transcript.to_str().unwrap());
+
+        let mut collector = PiCollector::with_sessions_root(tmp.path().to_path_buf());
+        let shared = empty_shared(); // no pid 9999 alive
+        let sessions = collector.collect_sessions(&shared);
+
+        assert!(sessions.is_empty(), "dead session must not appear: {:#?}", sessions);
+        assert!(
+            !active.join("9999.json").exists(),
+            "stale sidecar file should have been GC'd"
+        );
+    }
+
+    // Within the recency window a dead PID may still surface (Unknown) until it
+    // ages out, so the user briefly sees it instead of it vanishing instantly.
+    #[test]
+    fn stale_sidecar_with_fresh_transcript_shows_unknown_within_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let active = tmp.path().join("active");
+        std::fs::create_dir_all(&active).unwrap();
+        let transcript = write_transcript(tmp.path(), "fresh-sid", "/repo/abtop");
+        write_sidecar(&active, 9999, "fresh-sid", "/repo/abtop", transcript.to_str().unwrap());
+
+        let mut collector = PiCollector::with_sessions_root(tmp.path().to_path_buf());
+        let sessions = collector.collect_sessions(&empty_shared());
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, "fresh-sid");
+        assert_eq!(sessions[0].status, SessionStatus::Unknown);
+        // Not yet aged out -> file is NOT GC'd.
+        assert!(active.join("9999.json").exists());
+    }
+
+    // Restart in the same workspace: a prior dead session must not ghost a row
+    // onto the new PID, and must not double-count as Unknown.
+    #[test]
+    fn restart_in_same_workspace_shows_only_new_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let active = tmp.path().join("active");
+        std::fs::create_dir_all(&active).unwrap();
+
+        // Old session: dead sidecar + old transcript sharing the cwd.
+        let old_t = write_transcript(tmp.path(), "old-sid", "/repo/abtop");
+        set_mtime_old(&old_t);
+        write_sidecar(&active, 9998, "old-sid", "/repo/abtop", old_t.to_str().unwrap());
+
+        // New session: fresh transcript + live sidecar with pid 4242.
+        let new_t = write_transcript(tmp.path(), "new-sid", "/repo/abtop");
+        write_sidecar(&active, 4242, "new-sid", "/repo/abtop", new_t.to_str().unwrap());
+
+        let mut shared = empty_shared();
+        shared
+            .process_info
+            .insert(4242, proc_info(4242, "/repo/my-pi-agent", 200));
+
+        let mut collector = PiCollector::with_sessions_root(tmp.path().to_path_buf());
+        let sessions = collector.collect_sessions(&shared);
+
+        assert_eq!(sessions.len(), 1, "only the live session should appear: {:#?}", sessions);
+        assert_eq!(sessions[0].session_id, "new-sid");
+        assert_eq!(sessions[0].pid, 4242);
+        // Live + verified (never Unknown, unlike the pre-fix ghost).
+        assert_ne!(sessions[0].status, SessionStatus::Unknown);
+        // Old dead sidecar is GC'd (its transcript aged out).
+        assert!(!active.join("9998.json").exists());
+    }
+
+    // Pure transcript fallback (no sidecars installed): when multiple
+    // historical transcripts share a cwd that a live PID occupies, only the
+    // newest may be attributed to that PID (a single PID owns one cwd at a
+    // time). We can't stub /proc in a unit test, so exercise the discovery
+    // ordering + the no-PID fresh-window path instead: the newest transcript
+    // appears (as a fresh PID-0 row), older ones age out.
+    #[test]
+    fn transcript_fallback_shows_only_fresh_transcripts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _old = write_transcript(tmp.path(), "old-sid", "/repo/abtop");
+        set_mtime_old(&_old);
+        let _new = write_transcript(tmp.path(), "new-sid", "/repo/abtop");
+
+        let mut collector = PiCollector::with_sessions_root(tmp.path().to_path_buf());
+        // No live pi pid -> nothing attributed; only the fresh transcript shows.
+        let sessions = collector.collect_sessions(&empty_shared());
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, "new-sid");
+        assert_eq!(sessions[0].pid, 0);
+        assert_eq!(sessions[0].status, SessionStatus::Unknown);
     }
 }
