@@ -509,6 +509,47 @@ pub fn populate_demo(app: &mut App) {
             config_root: "~/.local/share/opencode".into(),
             file_accesses: vec![],
         },
+        AgentSession {
+            agent_cli: "pi",
+            pid: 9700,
+            session_id: "01a0150e-2f27-76c5-8aab-54b21c1a4907".into(),
+            cwd: "/Users/demo/pi-monitor".into(),
+            project_name: "pi-monitor".into(),
+            started_at: now - 2 * 60 * 1000, // 2m ago
+            status: SessionStatus::Executing,
+            model: "cuc/deepseek".into(),
+            effort: "minimal".into(),
+            context_percent: 42.5,
+            total_input_tokens: 31_800,
+            total_output_tokens: 6_200,
+            total_cache_read: 4_600,
+            total_cache_create: 900,
+            turn_count: 14,
+            current_tasks: vec!["edit src/pi.rs".into()],
+            mem_mb: 210,
+            version: "my-pi-agent 0.84.2".into(),
+            git_branch: "main".into(),
+            git_added: 3,
+            git_modified: 5,
+            token_history: vec![
+                4000, 6000, 9000, 12000, 15000, 20000, 24000, 28000, 31000,
+            ],
+            context_history: vec![],
+            compaction_count: 1,
+            context_window: 262_144,
+            subagents: vec![],
+            mem_file_count: 0,
+            mem_line_count: 0,
+            children: vec![],
+            first_assistant_text: String::new(),
+            chat_messages: vec![],
+            initial_prompt: "Add Pi support to the agent monitor".into(),
+            tool_calls: vec![],
+            pending_since_ms: 0,
+            thinking_since_ms: 0,
+            config_root: "~/.pi/agent".into(),
+            file_accesses: vec![],
+        },
     ];
 
     // --- Summaries (pre-populated, no LLM calls) ---
@@ -531,6 +572,10 @@ pub fn populate_demo(app: &mut App) {
     app.summaries.insert(
         "ses_e5f6a7b8-9abc-def0-1234-555555555555".into(),
         "Terraform multi-region refactor".into(),
+    );
+    app.summaries.insert(
+        "01a0150e-2f27-76c5-8aab-54b21c1a4907".into(),
+        "Add Pi support to the agent monitor".into(),
     );
 
     // --- Rate limits ---

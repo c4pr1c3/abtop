@@ -2,7 +2,9 @@
 
 AI agent monitor for your terminal. Like btop++, but for AI coding agents.
 
-Supports Claude Code, Codex CLI, OpenCode, kimi-code, and Hermes Agent sessions.
+Supports Claude Code, Codex CLI, OpenCode, kimi-code, Hermes Agent, and Pi sessions.
+
+**Pi is a first-class supported agent.** It is discovered from `~/.pi/agent/sessions` (any Pi or Pi-derivative coding agent built on `@earendil-works/pi-coding-agent`, e.g. my-pi-agent), contributes session / token / context-window / task / project / port data, and supports the `Enter` session-jump, on equal footing with the other agents (see §7).
 
 **kimi-code is a first-class supported agent and an active focus of development.** It is discovered from `~/.kimi-code`, contributes session / token / context-window / task / project / port data, and is on equal footing with Claude Code, Codex CLI, and OpenCode (see §5).
 
@@ -33,6 +35,7 @@ src/
 │   ├── opencode.rs         # OpenCode: session discovery via ps + SQLite DB parsing
 │   ├── kimi.rs             # kimi-code: session_index.jsonl discovery + wire.jsonl tailing
 │   ├── hermes.rs           # Hermes Agent: ~/.hermes/state.db (SQLite) discovery + ps pairing
+│   ├── pi.rs               # Pi: ~/.pi/agent/sessions active/{pid}.json sidecar + JSONL tail
 │   ├── process.rs          # Child process tree (ps) + open ports (lsof) + git stats
 │   └── rate_limit.rs       # Rate limit file reading (~/.claude/abtop-rate-limits.json)
 └── model/
@@ -252,11 +255,47 @@ earlier per-session JSONL trajectory format. v1 monitors the default profile onl
 - PID↔session pairing is by recency (no cwd column), so with multiple concurrent
   sessions in one profile the exact pairing is best-effort.
 
-### 7. Subagents: `~/.claude/projects/{path}/{sessionId}/subagents/`
+### 7. Pi sessions: `~/.pi/agent/sessions` + per-PID sidecar
+
+Pi (and Pi-derivatives built on the `@earendil-works/pi-coding-agent` SDK, e.g.
+my-pi-agent) stores sessions as append-only JSONL under
+`~/.pi/agent/sessions/--<encoded-cwd>--/<ts>_<sessionId>.jsonl`. The transcripts
+carry rich telemetry but **no PID and no exit marker**, so liveness + process
+attribution come from a per-PID sidecar written by a Pi-side monitor extension
+(see `docs/pi-sidecar-contract.md`):
+
+- **Sidecar** (authoritative): `~/.pi/agent/sessions/active/{pid}.json` holds
+  `pid`, `procStart` (PID-reuse guard), `sessionId`/`sessionFile`/`cwd`/
+  `startedAt`, distro `agent`/`version`, and `contextWindow`/`contextPercent`
+  from the extension's live context. Enumerate these files, verify liveness
+  (pid alive + procStart match), and use `contextWindow`/`contextPercent`
+  directly.
+- **Transcript-only fallback** (no sidecar installed): scan `*.jsonl` for the
+  `session` header `cwd` (authoritative; the encoded dir name is lossy), match
+  a live Pi process's `/proc/{pid}/cwd` to that cwd. PID=0, status `Unknown`,
+  recency-bounded so stale sessions age out. Context % is not derivable.
+
+Transcript parsing (mirrors the Claude collector): `message` entries —
+assistant `usage` (camelCase `input`/`output`/`cacheRead`/`cacheWrite`),
+`model`, chat roles (user/assistant/toolResult), `toolCall` content blocks
+(name + arguments) → tasks + file-access audit; `model_change`;
+`thinking_level_change` → effort; `custom` (`customType:"modes"`) → mode;
+`compaction` → compaction count; `session_info` → title.
+
+Pi exposes no rate-limit/quota telemetry (managed OAuth), so it contributes
+nothing to the quota panel — quota stays Claude + Codex only.
+
+**Known limitations of Pi support (v1):** context % requires the monitor
+sidecar (no reliable window via transcript fallback); no git branch from the
+transcript; no subagents/memory. The default config root is
+`~/.pi/agent/sessions` (`PI_CODING_AGENT_DIR`/`MY_PI_AGENT_CODING_AGENT_DIR`
+overrides are honored).
+
+### 8. Subagents: `~/.claude/projects/{path}/{sessionId}/subagents/`
 - `agent-{hash}.jsonl` — same JSONL format as main transcript
 - `agent-{hash}.meta.json` — `{ "agentType": "general-purpose", "description": "..." }`
 
-### 8. Process tree: `ps` + `lsof`
+### 9. Process tree: `ps` + `lsof`
 ```bash
 ps -eo pid,ppid,rss,%cpu,command    # All processes
 lsof -i -P -n -sTCP:LISTEN         # Open ports
@@ -264,16 +303,16 @@ lsof -i -P -n -sTCP:LISTEN         # Open ports
 - Build parent→children map from ppid
 - Map listening PID → parent agent PID → session
 
-### 9. Git status per project
+### 10. Git status per project
 ```bash
 git -C {cwd} status --porcelain     # added/modified file counts
 ```
 
-### 10. Memory status
+### 11. Memory status
 - Path: `~/.claude/projects/{encoded-path}/memory/`
 - Count files in directory + lines in `MEMORY.md`
 
-### 11. Rate limit (Claude Code)
+### 12. Rate limit (Claude Code)
 
 NOT in transcript JSONL. Collected via StatusLine mechanism.
 
@@ -293,7 +332,7 @@ File format read by abtop:
 - Account-level metric, shared across all sessions.
 - Show "—" when not configured or data unavailable.
 
-### 12. Other files
+### 13. Other files
 - `~/.claude/stats-cache.json` — daily aggregates. Only updated on `/stats`, NOT real-time.
 - `~/.claude/history.jsonl` — prompt history with sessionId.
 
