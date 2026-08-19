@@ -2,8 +2,8 @@
 
 **Like [btop](https://github.com/aristocratos/btop), but for your AI coding agents.**
 
-See every Claude Code, Codex CLI, OpenCode, kimi-code, and Hermes Agent session at a glance — token usage, context window %, rate limits, child processes, open ports, and more.
-Claude Code, Codex CLI, OpenCode, kimi-code, and Hermes Agent sessions are discovered from local process/file state, so multiple active profiles are supported across macOS, Linux, and Windows.
+See every Claude Code, Codex CLI, OpenCode, kimi-code, Hermes Agent, and Pi session at a glance — token usage, context window %, rate limits, child processes, open ports, and more.
+Claude Code, Codex CLI, OpenCode, kimi-code, Hermes Agent, and Pi sessions are discovered from local process/file state, so multiple active profiles are supported across macOS, Linux, and Windows.
 
 ![demo](https://raw.githubusercontent.com/graykode/abtop/main/assets/demo.gif)
 
@@ -75,24 +75,36 @@ tmux new -s work
 
 ## Supported Agents
 
-| Feature           | Claude Code | Codex CLI | OpenCode | kimi-code | Hermes |
-| ----------------- | :---------: | :-------: | :------: | :------: | :-----: |
-| Session Discovery |     ✅      |    ✅     |    ✅    |    ✅    |   ✅    |
-| Token Tracking    |     ✅      |    ✅     |    ✅    |    ✅    |   ✅    |
-| Context Window %  |     ✅      |    ✅     |    ❌    |    ✅    |   ❌    |
-| Status Detection  |     ✅      |    ✅     |    ✅    |    ✅    |   ✅    |
-| Current Task      |     ✅      |    ✅     |    ❌    |    ✅    |   ✅    |
-| Rate Limit        |     ✅      |    ✅     |    ❌    |    ❌    |   ❌    |
-| Git Status        |     ✅      |    ✅     |    ✅    |    ✅    |   ✅    |
-| Children / Ports  |     ✅      |    ✅     |    ✅    |    ✅    |   ✅    |
-| Subagents         |     ✅      |    ❌     |    ❌    |    ❌    |   ❌    |
-| Memory Status     |     ✅      |    ❌     |    ❌    |    ❌    |   ❌    |
+| Feature           | Claude Code | Codex CLI | OpenCode | kimi-code | Hermes | Pi |
+| ----------------- | :---------: | :-------: | :------: | :------: | :-----: | :-: |
+| Session Discovery |     ✅      |    ✅     |    ✅    |    ✅    |   ✅    | ✅  |
+| Token Tracking    |     ✅      |    ✅     |    ✅    |    ✅    |   ✅    | ✅  |
+| Context Window %  |     ✅      |    ✅     |    ❌    |    ✅    |   ❌    | ✅¹ |
+| Status Detection  |     ✅      |    ✅     |    ✅    |    ✅    |   ✅    | ✅² |
+| Current Task      |     ✅      |    ✅     |    ❌    |    ✅    |   ✅    | ✅  |
+| Rate Limit        |     ✅      |    ✅     |    ❌    |    ❌    |   ❌    | ❌  |
+| Git Status        |     ✅      |    ✅     |    ✅    |    ✅    |   ✅    | ✅³ |
+| Children / Ports  |     ✅      |    ✅     |    ✅    |    ✅    |   ✅    | ✅  |
+| Subagents         |     ✅      |    ❌     |    ❌    |    ❌    |   ❌    | ❌  |
+| Memory Status     |     ✅      |    ❌     |    ❌    |    ❌    |   ❌    | ❌  |
+
+¹ **Pi context window %** requires the Pi monitor sidecar (see below). Without the
+sidecar installed, Pi falls back to transcript-only discovery and shows no
+context %.
+
+² **Pi status** is derived as Executing / Thinking / Waiting / Unknown; there is
+no Error/Done state.
+
+³ **Pi git status** shows added/modified file counts (via the shared git pass)
+but no branch name.
 
 OpenCode support reads the local SQLite database at `~/.local/share/opencode/opencode.db` (also the default location on Windows; `%LOCALAPPDATA%\opencode` and `%APPDATA%\opencode` are probed as fallbacks) and requires `sqlite3` in `PATH` (on Windows: `winget install SQLite.SQLite`).
 
 kimi-code support reads `~/.kimi-code/session_index.jsonl` and tails each session's `agents/main/wire.jsonl`. It honors `$KIMI_CONFIG_DIR` and falls back to the legacy `~/.kimi` root. **kimi-code is a first-class supported agent and an active focus of development** — it contributes session, token, context-window, current-task, project, and port data. (Rate-limit/quota remains Claude + Codex only, since kimi uses managed OAuth with no local telemetry.)
 
 Hermes Agent support reads the local SQLite database at `$HERMES_HOME/state.db` (default `~/.hermes`) and requires `sqlite3` in `PATH`. Open CLI sessions are read from the `sessions` table (`ended_at IS NULL`, `source = 'cli'`) and paired with live `hermes` processes for cwd, status, and children/ports. It contributes session, token, status, current-task, git, and port data. (No context-window % or rate-limit column: Hermes is multi-provider with no single context window or managed quota.)
+
+Pi support (any Pi or Pi-derivative coding agent built on the `@earendil-works/pi-coding-agent` SDK, e.g. `my-pi-agent`) reads append-only JSONL transcripts under `~/.pi/agent/sessions` (honoring `$PI_CODING_AGENT_DIR` / `$MY_PI_AGENT_CODING_AGENT_DIR`). Liveness and process attribution come from a per-PID sidecar written by a [Pi monitor extension](docs/pi-sidecar-contract.md) at `~/.pi/agent/sessions/active/{pid}.json`, which also carries the live `contextWindow`/`contextPercent`. When no sidecar is installed, abtop falls back to matching transcripts to live Pi processes by cwd, showing sessions as `Unknown` with no context %. It contributes session, token, context-window (with sidecar), current-task, project, git-count, and port data. (No rate limit, subagents, or memory: Pi uses managed OAuth with no local quota or subagent/memory telemetry.)
 
 ## Themes
 
