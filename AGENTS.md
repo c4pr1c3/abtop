@@ -180,6 +180,15 @@ Rate limits extracted from `token_count` events:
 - Match live PIDs to DB sessions by process cwd. OpenCode does not expose a PID/session mapping, so when multiple DB rows share one cwd, only live PIDs should be assigned and older rows should not be shown as live duplicates.
 - OpenCode contributes session/token/project/port data, but not quota data. Quota remains Claude + Codex only.
 - **Context % is live, not cumulative, and excludes subagent turns.** OpenCode inlines sub-agent/task-agent turns (tagged with a different `agent` in each message's `data`) into the parent session's message table. The conversation token sums therefore filter to the session's own `agent` (`session.agent`), so subagent window consumption is not double-counted into the parent's context %. Context % is then derived from the most recent real LLM call's full prompt (`cache.read + input` of the last main-agent message that consumed tokens) over the model window — not the lifetime token sum. Sessions whose `agent` is unset fall back to counting all messages.
+- **Session title placeholder probing.** OpenCode writes a placeholder title
+  (`New Session` / `Session Start`, or a timestamped `New session - <ts>`) on
+  session creation and only later replaces it with a real topic title via its
+  hidden `title` subagent. The OpenCode summary therefore uses the live DB
+  title and, while it is still a placeholder, suppresses it during a
+  title-generation probe window (10s / 30s / 60s after first detection,
+  aligned with the ~10s DB refresh); the generic `claude --print` summarizer
+  is skipped for OpenCode so it never caches a placeholder-derived summary.
+  See `is_placeholder_title` in the OpenCode collector.
 
 ### 5. kimi-code sessions: `~/.kimi-code/sessions/wd_<base>_<hash>/session_<uuid>/`
 kimi migrated its storage from `~/.kimi` to `~/.kimi-code` (an `.migrated-to-kimi-code`
