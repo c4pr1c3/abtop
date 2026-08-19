@@ -531,8 +531,14 @@ fn read_server_lock_pid(root: &Path) -> Option<u32> {
 
 /// Walk the ancestor chain of `pid` (starting at its parent — the kimi process
 /// itself chdir's to the config root, so its own cwd is meaningless) and return
-/// each ancestor's cwd. The shell/pane cwd is kimi's launch directory, which
-/// equals the session `workDir`.
+/// each *shell* ancestor's cwd. The shell/pane cwd is kimi's launch directory,
+/// which equals the session `workDir`.
+///
+/// We stop at the first **non-shell** ancestor (terminal multiplexer, init,
+/// daemon). Their cwd is a stale launch-time directory, not the directory kimi
+/// was run in — e.g. a long-lived `tmux` server started years ago in some
+/// unrelated project would otherwise make every session in that project look
+/// "live" (ghost/zombie sessions attributed to the running kimi PID).
 fn ancestor_workdirs(pid: u32, process_info: &HashMap<u32, process::ProcInfo>) -> Vec<String> {
     let mut out = Vec::new();
     let Some(info) = process_info.get(&pid) else {
@@ -541,6 +547,17 @@ fn ancestor_workdirs(pid: u32, process_info: &HashMap<u32, process::ProcInfo>) -
     let mut cur = info.ppid;
     let mut visited = HashSet::new();
     while cur != 0 && visited.insert(cur) {
+        // Only trust the cwd of shell ancestors; stop at the first non-shell
+        // (tmux/screen server, init, daemon) whose cwd is meaningless. A kimi
+        // process is launched from its immediate shell chain, never from the
+        // tmux server itself, so traversing past the shell boundary only ever
+        // injects stale cwds as false workdirs.
+        if !process_info
+            .get(&cur)
+            .is_some_and(|i| is_shell_command(&i.command))
+        {
+            break;
+        }
         if let Some(cwd) = process_cwd(cur) {
             out.push(cwd);
         }
@@ -550,6 +567,31 @@ fn ancestor_workdirs(pid: u32, process_info: &HashMap<u32, process::ProcInfo>) -
         }
     }
     out
+}
+
+/// Whether a command string names a shell that could have launched kimi. Used to
+/// bound the ancestor-cwd walk to the real shell chain, excluding terminal
+/// multiplexer servers (tmux/screen) and daemons whose cwd is meaningless.
+fn is_shell_command(cmd: &str) -> bool {
+    let first = cmd.split_whitespace().next().unwrap_or("");
+    let base = first.rsplit('/').next().unwrap_or(first);
+    matches!(
+        base,
+        "bash"
+            | "sh"
+            | "zsh"
+            | "fish"
+            | "ksh"
+            | "dash"
+            | "ash"
+            | "csh"
+            | "tcsh"
+            | "pwsh"
+            | "powershell"
+            | "nu"
+            | "elvish"
+            | "xonsh"
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1293,6 +1335,20 @@ mod tests {
         let mut other_live = HashSet::new();
         other_live.insert("project_other".to_string());
         assert!(current_session_ids(&entries, &other_live).is_empty());
+    }
+
+    #[test]
+    fn is_shell_command_classifies_shells_and_stops_at_multiplexer() {
+        // Shells launch kimi; their cwd is the launch directory.
+        assert!(is_shell_command("/bin/bash -l"));
+        assert!(is_shell_command("zsh"));
+        assert!(is_shell_command("/usr/bin/fish"));
+        // Terminal multiplexer / init / daemon must NOT be treated as a shell,
+        // so ancestor_workdirs stops before their stale cwd is collected.
+        assert!(!is_shell_command("tmux"));
+        assert!(!is_shell_command("screen"));
+        assert!(!is_shell_command("/lib/systemd/systemd --user"));
+        assert!(!is_shell_command("kimi-code"));
     }
 
     #[test]

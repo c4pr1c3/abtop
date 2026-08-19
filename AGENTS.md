@@ -195,7 +195,10 @@ falls back to `~/.kimi` if the new root is absent.
   The shared server daemon's PID lives in `server/lock` (`{"pid":N,...}`) and is the global
   "kimi is running" gate. Each live `kimi-code` PID is attributed to a session by walking its
   ancestor shell chain and matching the shell's cwd (kimi's launch directory) to a session
-  `workDir`. Because a PID can be tied only to a directory (not a session), only the
+  `workDir`. The walk is bounded to **shell** ancestors and stops at the first non-shell
+  (tmux/screen/init/daemon) — a multiplexer server's cwd is a stale launch-time directory, not
+  the directory kimi was run in, so traversing past it would resurface every session that ever
+  ran there as a ghost. Because a PID can be tied only to a directory (not a session), only the
   single most-recently-active session under each live workdir is surfaced as current; older
   sessions sharing a workdir stay hidden unless they were just active, so historical runs do
   not reappear as ghosts whenever one process is alive in that directory. Exit detection is
