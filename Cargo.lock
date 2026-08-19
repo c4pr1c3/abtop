@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "abtop"
-version = "0.5.1"
+version = "0.5.3"
 dependencies = [
  "chrono",
  "crossterm",
@@ -16,6 +16,7 @@ dependencies = [
  "serde_json",
  "sysinfo",
  "tempfile",
+ "unicode-width 0.2.0",
 ]
 
 [[package]]
