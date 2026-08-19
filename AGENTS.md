@@ -179,6 +179,7 @@ Rate limits extracted from `token_count` events:
 - Read recent sessions from OpenCode's SQLite DB through `sqlite3 -readonly -json`.
 - Match live PIDs to DB sessions by process cwd. OpenCode does not expose a PID/session mapping, so when multiple DB rows share one cwd, only live PIDs should be assigned and older rows should not be shown as live duplicates.
 - OpenCode contributes session/token/project/port data, but not quota data. Quota remains Claude + Codex only.
+- **Context / token totals exclude subagent turns.** OpenCode inlines sub-agent/task-agent turns (tagged with a different `agent` in each message's `data`) into the parent session's message table. The session token sums therefore filter to the session's own `agent` (`session.agent`), so subagent window consumption is not double-counted into the parent's context %. Sessions whose `agent` is unset fall back to counting all messages.
 
 ### 5. kimi-code sessions: `~/.kimi-code/sessions/wd_<base>_<hash>/session_<uuid>/`
 kimi migrated its storage from `~/.kimi` to `~/.kimi-code` (an `.migrated-to-kimi-code`
@@ -194,8 +195,12 @@ falls back to `~/.kimi` if the new root is absent.
   The shared server daemon's PID lives in `server/lock` (`{"pid":N,...}`) and is the global
   "kimi is running" gate. Each live `kimi-code` PID is attributed to a session by walking its
   ancestor shell chain and matching the shell's cwd (kimi's launch directory) to a session
-  `workDir`. Exit detection is best-effort: a session with no live PID is also shown while its
-  wire log was touched within the last few minutes, then ages out.
+  `workDir`. Because a PID can be tied only to a directory (not a session), only the
+  single most-recently-active session under each live workdir is surfaced as current; older
+  sessions sharing a workdir stay hidden unless they were just active, so historical runs do
+  not reappear as ghosts whenever one process is alive in that directory. Exit detection is
+  best-effort: a session with no live PID is also shown while its wire log was touched within
+  the last few minutes, then ages out.
 - Tail `agents/main/wire.jsonl` (there is no separate `context.jsonl` anymore):
   - `usage.record` — per-turn tokens (`usage.inputOther` / `output` / `inputCacheRead` /
     `inputCacheCreation`, camelCase), `model`, `time` (epoch ms). kimi emits **no**

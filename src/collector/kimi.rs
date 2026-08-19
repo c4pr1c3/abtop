@@ -85,7 +85,7 @@ impl KimiCollector {
             return vec![];
         }
 
-        // Attribute each live kimi-code PID to a session by matching an
+        // Attribute each live kimi-code PID to a *workdir* by matching an
         // ancestor shell's cwd (kimi's launch directory) to a session workDir.
         // The PID's own cwd is skipped — kimi always chdir's to the config root.
         let mut pid_by_workdir: HashMap<String, u32> = HashMap::new();
@@ -94,6 +94,15 @@ impl KimiCollector {
                 pid_by_workdir.entry(cwd).or_insert(pid);
             }
         }
+
+        // kimi has no per-session PID file, so a live process can only be tied
+        // to the *directory* it was launched from — not to a specific session.
+        // Only the single most-recently-active session under each live workdir
+        // is the "current" one. Without this, every historical session that ever
+        // ran in a directory would resurface in the monitor whenever ONE
+        // kimi-code process is alive in that directory (ghost sessions).
+        let live_workdirs: HashSet<String> = pid_by_workdir.keys().cloned().collect();
+        let current_sessions = current_session_ids(&entries, &live_workdirs);
 
         let model_default = read_kimi_model(&self.config_root);
         let now = SystemTime::now();
@@ -109,9 +118,10 @@ impl KimiCollector {
                 .join("main")
                 .join("wire.jsonl");
             let fresh = file_age_secs(&wire_path, now) < SESSION_FRESH_SECS;
-            let attributed =
-                !entry.work_dir.is_empty() && pid_by_workdir.contains_key(&entry.work_dir);
-            // Primary signal: attributed to a live PID. Fallback: recently active.
+            // Primary signal: this is the current session under a live workdir.
+            // Fallback: recently active. Historical, non-current sessions in an
+            // otherwise-live directory stay hidden unless freshly active.
+            let attributed = current_sessions.contains(&entry.session_id);
             if !attributed && !fresh {
                 continue;
             }
@@ -385,6 +395,41 @@ struct IndexEntry {
     session_id: String,
     session_dir: PathBuf,
     work_dir: String,
+}
+
+/// The set of session IDs that are the **current** (most-recently-active)
+/// session under each *live* workdir.
+///
+/// kimi writes no per-session PID file, so a running `kimi-code` process can be
+/// attributed only to the directory it was launched from (a workDir), not to a
+/// specific session. Many historical sessions may share one workDir (kimi mints
+/// a new `session_<uuid>/` per run). When a single process is alive in a
+/// directory we must surface only the session it is actually driving — the one
+/// whose wire log was written most recently — and keep older runs hidden,
+/// otherwise every session that ever ran there reappears as a ghost.
+fn current_session_ids(entries: &[IndexEntry], live_workdirs: &HashSet<String>) -> HashSet<String> {
+    // workdir -> (latest wire mtime, current session id)
+    let mut newest_mtime: HashMap<&str, u64> = HashMap::new();
+    let mut current_id: HashMap<&str, String> = HashMap::new();
+    for entry in entries {
+        if entry.work_dir.is_empty() || !live_workdirs.contains(&entry.work_dir) {
+            continue;
+        }
+        let wire = entry
+            .session_dir
+            .join("agents")
+            .join("main")
+            .join("wire.jsonl");
+        let mtime = wire_mtime_ms(&wire).unwrap_or(0);
+        match newest_mtime.get(entry.work_dir.as_str()) {
+            Some(&m) if m >= mtime => {}
+            _ => {
+                newest_mtime.insert(entry.work_dir.as_str(), mtime);
+                current_id.insert(entry.work_dir.as_str(), entry.session_id.clone());
+            }
+        }
+    }
+    current_id.into_values().collect()
 }
 
 /// Parse `session_index.jsonl` into session entries. Falls back to scanning
@@ -1206,6 +1251,48 @@ mod tests {
         let root = kimi_config_root();
         std::env::remove_var("HOME");
         assert_eq!(root, new_root);
+    }
+
+    #[test]
+    fn current_session_ids_keeps_only_the_newest_per_live_workdir() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Two historical sessions plus a fresh one, all under one workdir.
+        let wd = "project_a";
+        let dir = tmp.path().join("sessions").join("wd_a").join("ses");
+        let entries: Vec<IndexEntry> = ["s1", "s2", "s3"]
+            .iter()
+            .map(|sid| {
+                let sd = dir.join(sid);
+                std::fs::create_dir_all(sd.join("agents/main")).unwrap();
+                IndexEntry {
+                    session_id: sid.to_string(),
+                    session_dir: dir.join(sid),
+                    work_dir: wd.to_string(),
+                }
+            })
+            .collect();
+
+        // s1 oldest, s2 middle, s3 newest (by wire mtime).
+        for (i, sid) in ["s1", "s2", "s3"].iter().enumerate() {
+            let wire = dir.join(sid).join("agents/main/wire.jsonl");
+            std::fs::write(&wire, format!("run {}\n", i)).unwrap();
+            let file = std::fs::File::open(&wire).unwrap();
+            let mtime = UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000 + i as u64);
+            let _ = file.set_modified(mtime);
+        }
+
+        // With the workdir live, only the newest (s3) is current.
+        let mut live = HashSet::new();
+        live.insert(wd.to_string());
+        let current = current_session_ids(&entries, &live);
+        assert_eq!(current.len(), 1);
+        assert!(current.contains("s3"), "expected only s3, got {:?}", current);
+
+        // An unrelated live workdir must not surface these sessions.
+        let mut other_live = HashSet::new();
+        other_live.insert("project_other".to_string());
+        assert!(current_session_ids(&entries, &other_live).is_empty());
     }
 
     #[test]

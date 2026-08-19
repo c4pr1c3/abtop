@@ -331,6 +331,11 @@ FROM session s
 LEFT JOIN project p ON s.project_id = p.id
 LEFT JOIN message m ON m.session_id = s.id
   AND json_extract(m.data, '$.role') = 'assistant'
+  /* Count only the session's own agent's messages. OpenCode inlines
+     subagent / task-agent turns (tagged with a different `agent`) into the
+     parent session's message table; without this filter those tokens would be
+     double-counted into the parent's context/totals, inflating context %. */
+  AND (TRIM(COALESCE(s.agent, '')) = '' OR json_extract(m.data, '$.agent') = s.agent)
 GROUP BY s.id
 ORDER BY s.time_updated DESC
 LIMIT {};"#,
