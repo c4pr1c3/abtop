@@ -20,7 +20,8 @@
 //! - `usage.record` — per-turn token breakdown (`inputOther` / `output` /
 //!   `inputCacheRead` / `inputCacheCreation`, camelCase) + `model` + `time` (ms).
 //!   kimi emits no context-window field, so context % is derived
-//!   (last-turn input / hardcoded 262144 window) like the Claude collector.
+//!   (last-turn input / the model's `max_context_size` from config.toml) like
+//!   the Claude collector.
 //! - `context.append_message` — user/assistant chat turns.
 //! - `context.append_loop_event` (`tool.call` / `tool.result` / `content.part`
 //!   / `step.*`) — tool calls (name + args), streaming assistant text, steps.
@@ -43,8 +44,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Maximum tool-call / chat / file-access entries kept per session to bound memory.
 const MAX_TOOL_CALLS: usize = 500;
-/// Hardcoded context window for the kimi-code model (no field is emitted).
-const KIMI_CONTEXT_WINDOW: u64 = 262_144;
+/// Hardcoded context window used when a session's model has no `max_context_size`
+/// entry in kimi's config.toml. Real models define their own window there
+/// (e.g. k3 = 1048576, kimi-for-coding = 262144); kimi itself reads
+/// `[models."<id>"].max_context_size`, so abtop mirrors that rather than
+/// hardcoding a single value.
+const DEFAULT_KIMI_CONTEXT_WINDOW: u64 = 262_144;
 /// Secondary liveness window: a session also shows if its wire log was touched
 /// this recently (the primary signal is attribution to a live PID).
 const SESSION_FRESH_SECS: u64 = 300;
@@ -104,7 +109,7 @@ impl KimiCollector {
         let live_workdirs: HashSet<String> = pid_by_workdir.keys().cloned().collect();
         let current_sessions = current_session_ids(&entries, &live_workdirs);
 
-        let model_default = read_kimi_model(&self.config_root);
+        let model_config = read_kimi_model_config(&self.config_root);
         let now = SystemTime::now();
         let mut sessions = Vec::new();
 
@@ -141,7 +146,7 @@ impl KimiCollector {
                 &entry.work_dir,
                 &entry.session_dir,
                 attached_pid,
-                &model_default,
+                &model_config,
                 shared,
             ) {
                 sessions.push(session);
@@ -176,7 +181,7 @@ impl KimiCollector {
         work_dir: &str,
         session_dir: &Path,
         pid: u32,
-        model_default: &str,
+        model_config: &KimiModelConfig,
         shared: &super::SharedProcessData,
     ) -> Option<AgentSession> {
         let session_id = session_id.to_string();
@@ -259,11 +264,19 @@ impl KimiCollector {
         // `custom_title`/`plan_mode` fields are gone.
         let title = read_state_title(&state_path).unwrap_or_default();
 
-        let model = if !cache.model.is_empty() {
+        // --- model id + config (display name + context window) ---
+        // kimi itself resolves the window from `[models."<id>"].max_context_size`
+        // in config.toml (e.g. kimi-code/k3 = 1048576, kimi-for-coding = 262144).
+        // Prefer the per-session model recorded in wire.jsonl, falling back to
+        // the configured default model. This is what the session was actually
+        // running under, so using it gives the correct context window / %%.
+        let model_id = if !cache.model.is_empty() {
             cache.model.clone()
         } else {
-            model_default.to_string()
+            model_config.default_model.clone()
         };
+        let model = model_config.display_for(&model_id);
+        let context_window = model_config.window_for(&model_id);
 
         let proc = shared.process_info.get(&pid);
         let mem_mb = proc.map(|p| p.rss_kb / 1024).unwrap_or(0);
@@ -320,8 +333,8 @@ impl KimiCollector {
             }
         }
 
-        let context_percent = if KIMI_CONTEXT_WINDOW > 0 {
-            (cache.context_tokens as f64 / KIMI_CONTEXT_WINDOW as f64) * 100.0
+        let context_percent = if context_window > 0 {
+            (cache.context_tokens as f64 / context_window as f64) * 100.0
         } else {
             0.0
         };
@@ -353,7 +366,7 @@ impl KimiCollector {
             token_history: cache.token_history.clone(),
             context_history: cache.context_history.clone(),
             compaction_count: 0,
-            context_window: KIMI_CONTEXT_WINDOW,
+            context_window,
             subagents: vec![],
             mem_file_count: 0,
             mem_line_count: 0,
@@ -858,57 +871,107 @@ fn read_state_title(state_path: &Path) -> Option<String> {
     }
 }
 
-/// Read the configured model's display name from `~/.kimi-code/config.toml`.
-/// Hand-scanned (abtop has no TOML dep): resolves `default_model` → its
-/// `[models."<id>"] display_name`. Falls back to the model id, then "kimi-code".
-fn read_kimi_model(config_root: &Path) -> String {
+/// Resolved kimi model configuration scraped from `~/.kimi-code/config.toml`.
+/// Hand-scanned (abtop has no TOML dep): captures `default_model` and each
+/// `[models."<id>"]` section's `max_context_size` (the context window) plus
+/// `display_name`. Mirrors how kimi itself derives these values.
+struct KimiModelConfig {
+    default_model: String,
+    /// model id (e.g. `kimi-code/k3`) → max_context_size (context window).
+    windows: HashMap<String, u64>,
+    /// model id → display_name.
+    display: HashMap<String, String>,
+}
+
+impl KimiModelConfig {
+    /// The context window (max_context_size) for a model id, falling back to the
+    /// default model, then to a conservative default.
+    fn window_for(&self, model_id: &str) -> u64 {
+        self.windows
+            .get(model_id)
+            .copied()
+            .or_else(|| self.windows.get(&self.default_model).copied())
+            .filter(|w| *w > 0)
+            .unwrap_or(DEFAULT_KIMI_CONTEXT_WINDOW)
+    }
+
+    /// Human-readable display name for a model id (display_name or the id itself).
+    fn display_for(&self, model_id: &str) -> String {
+        self.display
+            .get(model_id)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&model_id.to_string())
+            .to_string()
+    }
+}
+
+/// Parse kimi's `config.toml` for model metadata. Falls back to a bare default
+/// model config when the file is missing/unreadable.
+fn read_kimi_model_config(config_root: &Path) -> KimiModelConfig {
+    let mut cfg = KimiModelConfig {
+        default_model: String::new(),
+        windows: HashMap::new(),
+        display: HashMap::new(),
+    };
     let config = match fs::read_to_string(config_root.join("config.toml")) {
         Ok(c) => c,
-        Err(_) => return "kimi-code".to_string(),
+        Err(_) => return cfg,
     };
-    let model_id = config
-        .lines()
-        .find_map(|l| {
-            let l = l.trim();
-            let v = l
-                .strip_prefix("default_model")?
-                .trim_start()
-                .strip_prefix('=')?
-                .trim()
-                .trim_matches('"')
-                .trim();
-            if v.is_empty() {
-                None
-            } else {
-                Some(v.to_string())
-            }
-        })
-        .unwrap_or_default();
-    if model_id.is_empty() {
-        return "kimi-code".to_string();
-    }
-    // Find `[models."<model_id>"]` section, then its display_name.
-    let header = format!("[models.\"{}\"]", model_id);
-    let mut in_section = false;
+
+    let mut section_model = String::new();
     for line in config.lines() {
         let t = line.trim();
-        if t.starts_with('[') {
-            in_section = t == header;
+        // Top-level `default_model = "..."`.
+        if let Some(rest) = t.strip_prefix("default_model") {
+            if let Some(v) = rest
+                .trim_start()
+                .strip_prefix('=')
+                .map(|v| v.trim().trim_matches('"').trim().to_string())
+            {
+                if !v.is_empty() {
+                    cfg.default_model = v.clone();
+                }
+            }
             continue;
         }
-        if in_section {
-            if let Some(v) = t
-                .strip_prefix("display_name")
-                .and_then(|s| s.trim().strip_prefix('='))
-            {
-                let v = v.trim().trim_matches('"').trim();
-                if !v.is_empty() {
-                    return v.to_string();
-                }
+        // `[models."<id>"]` — begin a model section.
+        if let Some(rest) = t.strip_prefix("[models.\"") {
+            let id = rest.split('"').next().unwrap_or("").to_string();
+            if id.is_empty() {
+                section_model = String::new();
+                continue;
+            }
+            section_model = id.clone();
+            if cfg.default_model.is_empty() {
+                cfg.default_model = id.clone();
+            }
+            continue;
+        }
+        // Any other table header closes the current model section.
+        if t.starts_with('[') {
+            section_model = String::new();
+            continue;
+        }
+        if section_model.is_empty() {
+            continue;
+        }
+        if let Some(v) = t
+            .strip_prefix("max_context_size")
+            .and_then(|s| s.trim_start().strip_prefix('='))
+            .and_then(|s| s.trim().trim_matches('"').trim().parse::<u64>().ok())
+        {
+            cfg.windows.insert(section_model.clone(), v);
+        } else if let Some(v) = t
+            .strip_prefix("display_name")
+            .and_then(|s| s.trim_start().strip_prefix('='))
+        {
+            let v = v.trim().trim_matches('"').trim().to_string();
+            if !v.is_empty() {
+                cfg.display.insert(section_model.clone(), v);
             }
         }
     }
-    model_id
+    cfg
 }
 
 // ---------------------------------------------------------------------------
@@ -1293,6 +1356,42 @@ mod tests {
         let root = kimi_config_root();
         std::env::remove_var("HOME");
         assert_eq!(root, new_root);
+    }
+
+    #[test]
+    fn kimi_model_config_reads_window_and_display_per_model() {
+        // k3 has a 1M window; kimi-for-coding a 262k window. The parser must
+        // resolve each model's max_context_size (kimi reads config.toml itself).
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &cfg_path,
+            r#"default_model = "kimi-code/k3"
+[models."kimi-code/k3"]
+provider = "managed:kimi-code"
+model = "k3"
+max_context_size = 1048576
+display_name = "K3"
+[models."kimi-code/kimi-for-coding"]
+provider = "managed:kimi-code"
+model = "kimi-for-coding"
+max_context_size = 262144
+display_name = "K2.7 Coding"
+"#,
+        )
+        .unwrap();
+
+        let cfg = read_kimi_model_config(tmp.path());
+        assert_eq!(cfg.default_model, "kimi-code/k3");
+        assert_eq!(cfg.window_for("kimi-code/k3"), 1_048_576);
+        assert_eq!(cfg.window_for("kimi-code/kimi-for-coding"), 262_144);
+        assert_eq!(cfg.display_for("kimi-code/k3"), "K3");
+        // Unknown model falls back to the default model's window.
+        assert_eq!(cfg.window_for("kimi-code/unknown"), 1_048_576);
+        assert_eq!(cfg.display_for("kimi-code/unknown"), "kimi-code/unknown");
+        // Empty/missing config → conservative default window.
+        let empty = read_kimi_model_config(&tmp.path().join("missing-dir"));
+        assert_eq!(empty.window_for("anything"), DEFAULT_KIMI_CONTEXT_WINDOW);
     }
 
     #[test]

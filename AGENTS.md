@@ -207,8 +207,9 @@ falls back to `~/.kimi` if the new root is absent.
 - Tail `agents/main/wire.jsonl` (there is no separate `context.jsonl` anymore):
   - `usage.record` — per-turn tokens (`usage.inputOther` / `output` / `inputCacheRead` /
     `inputCacheCreation`, camelCase), `model`, `time` (epoch ms). kimi emits **no**
-    context-window field, so context % is derived (last-turn input / hardcoded 262144 window),
-    mirroring the Claude collector's accounting.
+    context-window field, so context % is derived (last-turn input / the model's
+    `max_context_size` from `config.toml`, e.g. k3 = 1048576), mirroring the
+    Claude collector's accounting.
   - `context.append_message` — user/assistant chat turns (`message.role` / `message.content`).
   - `context.append_loop_event` — `tool.call` (tool name + args → current task, tool timeline,
     file-access audit), `tool.result`, `content.part` (streaming assistant text), `step.*`.
@@ -218,7 +219,10 @@ falls back to `~/.kimi` if the new root is absent.
   no local rate-limit telemetry). Quota remains Claude + Codex only.
 
 **Known limitations of kimi support (all heuristic/derived):**
-- Context % is **derived** against a hardcoded 262,144-token window (`KIMI_CONTEXT_WINDOW`); kimi emits no context-window field. Same approach as the Claude collector.
+- Context % is **derived** against the model's `max_context_size` from
+  `config.toml` (e.g. k3 = 1048576, kimi-for-coding = 262144); kimi emits no
+  context-window field. Same approach as the Claude collector. A conservative
+  fallback window (262144) is used when the model isn't in config.
 - **No git branch** — only added/modified counts are populated by the shared git pass; kimi has no transcript-level branch field, so the projects panel shows counts but no branch name.
 - **No Error/Done status** — only Executing / Thinking / Waiting are derived from activity.
 - **No rate-limit/quota telemetry** (managed OAuth) — quota stays Claude + Codex only.
@@ -384,7 +388,10 @@ Not provided in data files. Derive:
   - `claude-opus-4-6[1m]` → 1,000,000
   - `claude-sonnet-4-6` → 200,000
   - `claude-haiku-4-5` → 200,000
-  - kimi-code → 262,144 (hardcoded `KIMI_CONTEXT_WINDOW`; kimi emits no window field, so the same derivation applies — see §5)
+  - kimi → the session model's `max_context_size` from `~/.kimi-code/config.toml`
+    (e.g. k3 = 1,048,576, kimi-for-coding = 262,144); kimi emits no window field,
+    so abtop reads it from config the same way kimi does. Falls back to a
+    conservative 262,144 when the model isn't in config (see §5)
   - OpenCode → 1,000,000 for GLM-5.2+ (Z.ai / Zhipu; detected by `glm-5.<minor>=2+`), else 200,000
   - Hermes → **not derived** (multi-provider; no single context window — see §6)
 - **Current usage**: last `assistant` line's `input_tokens + cache_read_input_tokens`. `cache_creation_input_tokens` is intentionally excluded — on compaction turns the same tokens can be reported as both `cache_creation` *and* `cache_read`, and summing all three double-counts (#54). Matches Claude Code's own statusline and the Codex collector.
