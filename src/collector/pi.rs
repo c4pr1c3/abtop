@@ -171,9 +171,16 @@ impl PiCollector {
             {
                 continue; // already handled from the sidecar (live or stale)
             }
+            // A workspace served by a live verified sidecar is fully covered by
+            // it — skip the whole cwd so an unclaimed-but-fresh transcript
+            // there (e.g. a just-finished prior session) can't ghost in as an
+            // Unknown PID-0 row. Attribution alone is not enough: that path also
+            // exits through the fresh-window display branch.
+            if live_sidecar_cwds.contains(&header.cwd) {
+                continue;
+            }
             let attributed = !header.cwd.is_empty()
-                && pid_by_cwd.contains_key(&header.cwd)
-                && !live_sidecar_cwds.contains(&header.cwd);
+                && pid_by_cwd.contains_key(&header.cwd);
             let fresh = file_age_secs(&path, now) < SESSION_FRESH_SECS;
             if !attributed && !fresh {
                 continue;
@@ -921,7 +928,16 @@ fn derive_status(
             .map(|d| d.as_secs() < ACTIVITY_FRESH_SECS)
             .unwrap_or(false)
     });
-    if has_active_descendant || !cache.current_task.is_empty() {
+    // A live CPU-active descendant (a running tool or background subagent) is
+    // the definitive Executing signal.
+    if has_active_descendant {
+        SessionStatus::Executing
+    } else if fresh && !cache.current_task.is_empty() {
+        // `current_task` is sticky (it records the last tool and is never
+        // cleared), so it alone can't tell "mid-tool" from "tool finished and
+        // waiting for input". Only treat it as Executing while the session is
+        // still recently active (task may run in-process without a CPU child);
+        // once activity ages out it must fall through to Waiting.
         SessionStatus::Executing
     } else if fresh {
         SessionStatus::Thinking
@@ -1206,6 +1222,85 @@ mod tests {
         assert!(!pids.contains(&4));
     }
 
+    /// Build a `SharedProcessData` with the given cpu-active descendants under
+    /// `pid` (children whose `cpu_pct` exceeds the 5% threshold that
+    /// `derive_status` uses for `has_active_descendant`).
+    fn shared_with_active_descendant(pid: u32) -> super::super::SharedProcessData {
+        let mut shared = empty_shared();
+        shared
+            .process_info
+            .insert(pid, proc_info(pid, "/repo/my-pi-agent", 100));
+        // A high-CPU child (running tool / background subagent).
+        let child = proc_info(pid + 1, "/bin/bash -c make", 1);
+        // cpu_pct is 0 in proc_info(); set it directly to a value > 5.0.
+        let mut child = child;
+        child.cpu_pct = 40.0;
+        shared.process_info.insert(pid + 1, child);
+        shared.children_map.insert(pid, vec![pid + 1]);
+        shared
+    }
+
+    // Regression: after a tool finishes and Pi is idle waiting for user input
+    // (no run/background subagent), the session must be Waiting — even though
+    // `current_task` is sticky and still holds the last tool. It must NOT stay
+    // stuck at Executing forever because of that stickiness.
+    #[test]
+    fn status_waiting_after_tool_finishes_despite_sticky_current_task() {
+        // Idle: no live PID, no active descendant. `current_task` still holds a
+        // tool from a finished turn, but the session has aged out of the fresh
+        // window, so it should be Waiting.
+        let cache = PiCache {
+            current_task: "bash make".to_string(),
+            last_activity: Some(
+                SystemTime::now() - std::time::Duration::from_secs(ACTIVITY_FRESH_SECS + 60),
+            ),
+            ..PiCache::default()
+        };
+        let shared = empty_shared();
+        assert_eq!(
+            derive_status(4242, true, &cache, &shared),
+            SessionStatus::Waiting
+        );
+    }
+
+    #[test]
+    fn status_executing_when_tool_runs_as_active_descendant() {
+        let cache = PiCache {
+            current_task: "bash make".to_string(),
+            last_activity: Some(SystemTime::now()),
+            ..PiCache::default()
+        };
+        let shared = shared_with_active_descendant(4242);
+        assert_eq!(
+            derive_status(4242, true, &cache, &shared),
+            SessionStatus::Executing
+        );
+    }
+
+    #[test]
+    fn status_executing_only_while_recently_active_with_current_task() {
+        // `current_task` non-empty + recent activity (mid-tool, possibly an
+        // in-process tool without a CPU child) -> Executing is acceptable.
+        let cache = PiCache {
+            current_task: "bash make".to_string(),
+            last_activity: Some(SystemTime::now()),
+            ..PiCache::default()
+        };
+        let shared = empty_shared();
+        assert_eq!(
+            derive_status(4242, true, &cache, &shared),
+            SessionStatus::Executing
+        );
+    }
+
+    #[test]
+    fn status_unverified_is_unknown() {
+        let cache = PiCache::default();
+        let shared = empty_shared();
+        assert_eq!(derive_status(4242, false, &cache, &shared), SessionStatus::Unknown);
+    }
+
+
     #[test]
     fn transcript_parses_usage_into_tokens() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1428,6 +1523,45 @@ mod tests {
         // Old dead sidecar is GC'd (its transcript aged out).
         assert!(!active.join("9998.json").exists());
     }
+
+    // Regression: a workspace served by a live verified sidecar must not also
+    // surface a *different* unclaimed-but-fresh transcript in the same cwd as an
+    // Unknown PID-0 ghost. The live sidecar fully covers the workspace, so the
+    // transcript fallback must skip it entirely (not just stop attributing it).
+    #[test]
+    fn live_sidecar_cwd_swallows_unclaimed_fresh_transcript() {
+        let tmp = tempfile::tempdir().unwrap();
+        let active = tmp.path().join("active");
+        std::fs::create_dir_all(&active).unwrap();
+
+        // Live verified sidecar for the workspace.
+        let live_t = write_transcript(tmp.path(), "live-sid", "/repo/abtop");
+        write_sidecar(&active, 4242, "live-sid", "/repo/abtop", live_t.to_str().unwrap());
+
+        // A *second*, unclaimed transcript in the same cwd, still fresh (e.g. a
+        // just-finished prior session whose sidecar was already GC'd).
+        let ghost_t = write_transcript(tmp.path(), "ghost-sid", "/repo/abtop");
+
+        let mut shared = empty_shared();
+        shared
+            .process_info
+            .insert(4242, proc_info(4242, "/repo/my-pi-agent", 200));
+
+        let mut collector = PiCollector::with_sessions_root(tmp.path().to_path_buf());
+        let sessions = collector.collect_sessions(&shared);
+
+        assert_eq!(
+            sessions.len(),
+            1,
+            "only the live sidecar session should appear, no PID-0 ghost: {:#?}",
+            sessions
+        );
+        assert_eq!(sessions[0].session_id, "live-sid");
+        assert_eq!(sessions[0].pid, 4242);
+        assert_ne!(sessions[0].status, SessionStatus::Unknown);
+        let _ = ghost_t; // transcript must exist for a valid reproduction
+    }
+
 
     // Pure transcript fallback (no sidecars installed): when multiple
     // historical transcripts share a cwd that a live PID occupies, only the
