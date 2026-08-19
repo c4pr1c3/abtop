@@ -179,7 +179,7 @@ Rate limits extracted from `token_count` events:
 - Read recent sessions from OpenCode's SQLite DB through `sqlite3 -readonly -json`.
 - Match live PIDs to DB sessions by process cwd. OpenCode does not expose a PID/session mapping, so when multiple DB rows share one cwd, only live PIDs should be assigned and older rows should not be shown as live duplicates.
 - OpenCode contributes session/token/project/port data, but not quota data. Quota remains Claude + Codex only.
-- **Context / token totals exclude subagent turns.** OpenCode inlines sub-agent/task-agent turns (tagged with a different `agent` in each message's `data`) into the parent session's message table. The session token sums therefore filter to the session's own `agent` (`session.agent`), so subagent window consumption is not double-counted into the parent's context %. Sessions whose `agent` is unset fall back to counting all messages.
+- **Context % is live, not cumulative, and excludes subagent turns.** OpenCode inlines sub-agent/task-agent turns (tagged with a different `agent` in each message's `data`) into the parent session's message table. The conversation token sums therefore filter to the session's own `agent` (`session.agent`), so subagent window consumption is not double-counted into the parent's context %. Context % is then derived from the most recent real LLM call's full prompt (`cache.read + input` of the last main-agent message that consumed tokens) over the model window — not the lifetime token sum. Sessions whose `agent` is unset fall back to counting all messages.
 
 ### 5. kimi-code sessions: `~/.kimi-code/sessions/wd_<base>_<hash>/session_<uuid>/`
 kimi migrated its storage from `~/.kimi` to `~/.kimi-code` (an `.migrated-to-kimi-code`
@@ -382,8 +382,10 @@ Not provided in data files. Derive:
   - `claude-sonnet-4-6` → 200,000
   - `claude-haiku-4-5` → 200,000
   - kimi-code → 262,144 (hardcoded `KIMI_CONTEXT_WINDOW`; kimi emits no window field, so the same derivation applies — see §5)
+  - OpenCode → 1,000,000 for GLM-5.2+ (Z.ai / Zhipu; detected by `glm-5.<minor>=2+`), else 200,000
   - Hermes → **not derived** (multi-provider; no single context window — see §6)
 - **Current usage**: last `assistant` line's `input_tokens + cache_read_input_tokens`. `cache_creation_input_tokens` is intentionally excluded — on compaction turns the same tokens can be reported as both `cache_creation` *and* `cache_read`, and summing all three double-counts (#54). Matches Claude Code's own statusline and the Codex collector.
+  - OpenCode → the most recent real LLM call's full prompt (`cache.read + input` of the last main-agent message that consumed tokens); zero-token stub messages are skipped.
 - **Percentage**: current_usage / window_size * 100
 - **Warning**: yellow at 80%, red at 90%, ⚠ icon at 90%+
 

@@ -187,8 +187,10 @@ impl OpenCodeCollector {
             };
 
             let context_window = context_window_for_model(&model, "", 0);
+            // Context % = current context usage (last real LLM call's full
+            // prompt) over the model window — not the cumulative lifetime sum.
             let context_percent = if context_window > 0 {
-                ((ds.total_input + ds.total_output) as f64 / context_window as f64) * 100.0
+                (ds.context_tokens as f64 / context_window as f64) * 100.0
             } else {
                 0.0
             };
@@ -326,7 +328,24 @@ SELECT
   COALESCE(SUM(json_extract(m.data, '$.tokens.input')), 0) as total_input,
   COALESCE(SUM(json_extract(m.data, '$.tokens.output')), 0) as total_output,
   COALESCE(SUM(json_extract(m.data, '$.tokens.cache.read')), 0) as total_cache_read,
-  COALESCE(SUM(json_extract(m.data, '$.tokens.cache.write')), 0) as total_cache_write
+  COALESCE(SUM(json_extract(m.data, '$.tokens.cache.write')), 0) as total_cache_write,
+  /* Current context usage: the most recent real LLM call's full prompt, i.e.
+     the latest main-agent assistant message that actually consumed tokens
+     (cache.read is the accumulated context being re-read, + fresh input). This
+     is what a live context % tracks — NOT the cumulative lifetime sum. Zero-
+     token placeholder messages (stubs written before a call completes) are
+     skipped. */
+  COALESCE((
+    SELECT COALESCE(COALESCE(json_extract(mm.data, '$.tokens.cache.read'), 0)
+                      + COALESCE(json_extract(mm.data, '$.tokens.input'), 0), 0)
+    FROM message mm
+    WHERE mm.session_id = s.id
+      AND json_extract(mm.data, '$.role') = 'assistant'
+      AND (TRIM(COALESCE(s.agent, '')) = '' OR json_extract(mm.data, '$.agent') = s.agent)
+      AND (COALESCE(json_extract(mm.data, '$.tokens.cache.read'), 0)
+           + COALESCE(json_extract(mm.data, '$.tokens.input'), 0)) > 0
+    ORDER BY mm.time_created DESC LIMIT 1
+  ), 0) as context_tokens
 FROM session s
 LEFT JOIN project p ON s.project_id = p.id
 LEFT JOIN message m ON m.session_id = s.id
@@ -403,6 +422,7 @@ LIMIT {};"#,
                 total_output: row["total_output"].as_u64().unwrap_or(0),
                 total_cache_read: row["total_cache_read"].as_u64().unwrap_or(0),
                 total_cache_write: row["total_cache_write"].as_u64().unwrap_or(0),
+                context_tokens: row["context_tokens"].as_u64().unwrap_or(0),
                 model,
                 provider,
             });
@@ -437,6 +457,7 @@ struct DbSession {
     total_output: u64,
     total_cache_read: u64,
     total_cache_write: u64,
+    context_tokens: u64,
     model: String,
     provider: String,
 }

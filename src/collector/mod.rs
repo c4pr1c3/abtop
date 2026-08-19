@@ -153,11 +153,29 @@ pub(crate) fn context_window_for_model(
     if transcript_model.contains("[1m]")
         || configured_model.contains("[1m]")
         || max_context_tokens > 200_000
+        || is_glm_52_plus(transcript_model)
+        || is_glm_52_plus(configured_model)
     {
         1_000_000
     } else {
         200_000
     }
+}
+
+/// GLM-5.2 and later (Z.ai / Zhipu) expose a 1M context window; GLM-5/5.1 ship
+/// the ~200K window. Detects a case-insensitive `glm-5.<minor>=2+` prefix,
+/// tolerating a provider prefix (e.g. `zhipu-coding-plan/glm-5.3`).
+fn is_glm_52_plus(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    const PREFIX: &str = "glm-5.";
+    let Some(idx) = lower.find(PREFIX) else {
+        return false;
+    };
+    lower[idx + PREFIX.len()..]
+        .chars()
+        .next()
+        .and_then(|c| c.to_digit(10))
+        .is_some_and(|minor| minor >= 2)
 }
 
 impl SharedProcessData {
@@ -518,6 +536,23 @@ impl MultiCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_window_glm52_plus_is_1m_and_older_glm_is_200k() {
+        // GLM-5.2 / 5.3 (with optional provider prefix) expose a 1M window.
+        assert_eq!(context_window_for_model("zhipu-coding-plan/glm-5.3", "", 0), 1_000_000);
+        assert_eq!(context_window_for_model("glm-5.2", "", 0), 1_000_000);
+        assert_eq!(context_window_for_model("GLM-5.3", "", 0), 1_000_000);
+        // GLM-5 / 5.1 keep the ~200K window.
+        assert_eq!(context_window_for_model("glm-5", "", 0), 200_000);
+        assert_eq!(context_window_for_model("glm-5.1", "", 0), 200_000);
+        // Unrelated models are unaffected.
+        assert_eq!(context_window_for_model("claude-opus-4-6", "", 0), 200_000);
+        assert_eq!(
+            context_window_for_model("claude-opus-4-6[1m]", "", 0),
+            1_000_000
+        );
+    }
 
     #[test]
     fn with_hidden_empty_keeps_all_collectors() {
