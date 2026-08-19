@@ -559,9 +559,10 @@ pub(crate) fn draw_sessions_panel_active(
         let timeline_full_width = timeline_default && !has_left_detail;
 
         // Always show SESSION header (task) at top, then children/subagents/timeline/file_audit below
+        let task_line = app.session_task_line(session);
         let session_header_h: u16 = {
             let mut h = 1u16; // SESSION title
-            if !session.initial_prompt.is_empty() {
+            if task_line.is_some() {
                 h += 1;
             }
             h
@@ -606,7 +607,7 @@ pub(crate) fn draw_sessions_panel_active(
                     .fg(theme.title)
                     .add_modifier(Modifier::BOLD),
             )));
-            if !session.initial_prompt.is_empty() {
+            if let Some(task) = task_line {
                 let max_w = (header_area.width as usize).saturating_sub(9);
                 lines.push(Line::from(vec![
                     Span::styled(
@@ -614,7 +615,7 @@ pub(crate) fn draw_sessions_panel_active(
                         Style::default().fg(theme.graph_text),
                     ),
                     Span::styled(
-                        truncate_str(&session.initial_prompt, max_w),
+                        truncate_str(&task, max_w),
                         Style::default().fg(theme.main_fg),
                     ),
                 ]));

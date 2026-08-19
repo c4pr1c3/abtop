@@ -495,6 +495,57 @@ fn truncate_field(s: &mut String, max_bytes: usize) {
     }
 }
 
+/// OpenCode writes a placeholder session title on session creation (e.g.
+/// "New Session", "Session Start", "New session - <timestamp>") and only
+/// later replaces it with a real topic title via its background `title`
+/// subagent. When title generation is slow or misconfigured, the DB can also
+/// briefly hold the title-agent's own generation instruction ("generate a
+/// title ...") instead of a meaningful title.
+///
+/// Returns `true` for any of these placeholder forms so the monitor can
+/// avoid surfacing them as the session summary.
+pub fn is_placeholder_title(title: &str) -> bool {
+    let t = title.trim();
+    if t.is_empty() {
+        return true;
+    }
+    let lower = t.to_lowercase();
+    // Exact generic placeholders OpenCode uses before title generation.
+    const GENERIC: &[&str] = &[
+        "new session",
+        "session start",
+        "new chat",
+        "new conversation",
+        "new",
+        "untitled",
+        "welcome",
+    ];
+    if GENERIC.contains(&lower.as_str()) {
+        return true;
+    }
+    // Timestamped defaults like "New session - 1739123849" or
+    // "Session Start - Sun Aug 19 ...".
+    if lower.starts_with("new session") || lower.starts_with("session start") {
+        return true;
+    }
+    // Title-agent prompt echo: when title generation stalls, the DB can hold
+    // the title-generator's own instruction text rather than a real topic
+    // title. These are meta-instructions about naming, not meaningful titles.
+    const META: &[&str] = &[
+        "generate a title",
+        "generate a conversation title",
+        "title for this conversation",
+        "you are a title",
+        "you are a conversation title generator",
+        "生成一个标题",
+        "生成一个对话标题",
+        "生成会话标题",
+        "总结对话",
+        "summarize this conversation",
+    ];
+    META.iter().any(|m| lower.contains(m))
+}
+
 /// Compare a process cwd with a DB session directory.
 /// On Windows paths are case-insensitive and may mix `/` and `\`, so
 /// normalize before comparing; elsewhere keep the exact comparison.
@@ -678,6 +729,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn is_placeholder_title_detects_open_placeholders() {
+        for t in [
+            "",
+            "   ",
+            "New Session",
+            "Session Start",
+            "new session",
+            "New Session - 1739123849",
+            "New chat",
+            "New Conversation",
+            "Untitled",
+            "Welcome",
+        ] {
+            assert!(
+                is_placeholder_title(t),
+                "expected {t:?} to be a placeholder"
+            );
+        }
+    }
+
+    #[test]
+    fn is_placeholder_title_rejects_real_titles() {
+        for t in [
+            "Fix the billing race condition in payments",
+            "Refactor auth module for OAuth2",
+            "Investigating the flaky integration test #42",
+            "Add dark mode to the settings panel",
+        ] {
+            assert!(
+                !is_placeholder_title(t),
+                "expected {t:?} to be a real title"
+            );
+        }
+    }
+
+    #[test]
+    fn is_placeholder_title_detects_title_agent_prompt_echo() {
+        for t in [
+            "Generate a title for this conversation",
+            "我们要求生成一个标题，用户消息是中文，标题要简洁",
+            "Generate a title: summarize the user's main task",
+            "You are a conversation title generator. Given the conversation",
+        ] {
+            assert!(
+                is_placeholder_title(t),
+                "expected {t:?} to be a placeholder (title-agent echo)"
+            );
+        }
+    }
     #[test]
     fn match_pid_no_last_resort_when_cwd_and_cmdline_disagree() {
         // Regression: previously, when exactly one opencode process was

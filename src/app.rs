@@ -13,6 +13,13 @@ const GRAPH_HISTORY_LEN: usize = 200;
 const MAX_SUMMARY_JOBS: usize = 3;
 /// Max summary attempts per session before giving up.
 const MAX_SUMMARY_RETRIES: u32 = 2;
+/// OpenCode writes a placeholder session title at creation (e.g. "New
+/// Session" / "Session Start") and only later replaces it with a real topic
+/// title via its background `title` subagent. The collector re-reads the DB
+/// title on every slow tick (~10s), so a real title landing at any of the
+/// 10s / 30s / 60s probe marks is picked up automatically. We keep waiting
+/// for up to 60s before settling on the placeholder as the final fallback.
+const OCO_TITLE_MAX_WAIT_MS: u64 = 60_000;
 
 /// Produce a terminal-safe fallback summary from a raw prompt.
 fn sanitize_fallback(prompt: &str, max_len: usize) -> String {
@@ -96,6 +103,12 @@ pub struct App {
     prev_tokens: HashMap<(String, String), u64>,
     /// Rate limit poll counter (read every 5 ticks = 10s)
     rate_limit_counter: u32,
+    /// First-seen timestamp (unix ms) of each OpenCode session that is still
+    /// showing a placeholder title. Drives the 10s/30s/60s title re-probes;
+    /// entries are dropped once a real title resolves or the session
+    /// disappears (bounded map).
+    opencode_title_first_seen: HashMap<String, u64>,
+    /// Channel to receive completed summaries from background threads.
     collector: MultiCollector,
     /// Cached LLM-generated summaries, keyed by session_id.
     pub summaries: HashMap<String, String>,
@@ -186,6 +199,7 @@ impl App {
             summary_retries: HashMap::new(),
             summary_rx: rx,
             summary_tx: tx,
+            opencode_title_first_seen: HashMap::new(),
             orphan_ports: Vec::new(),
             status_msg: None,
             kill_confirm: None,
@@ -517,6 +531,24 @@ impl App {
         }
         self.clamp_selection_to_visible();
 
+        // Maintain OpenCode title-probe timestamps: seed when a session first
+        // shows a placeholder title, drop entries once a real title lands or
+        // the session disappears (bounded map).
+        let now_ms = unix_ms();
+        let mut opencode_pending: HashSet<&str> = HashSet::new();
+        for s in &self.sessions {
+            if s.agent_cli == "opencode"
+                && crate::collector::opencode::is_placeholder_title(&s.initial_prompt)
+            {
+                opencode_pending.insert(s.session_id.as_str());
+                self.opencode_title_first_seen
+                    .entry(s.session_id.clone())
+                    .or_insert(now_ms);
+            }
+        }
+        self.opencode_title_first_seen
+            .retain(|sid, _| opencode_pending.contains(sid.as_str()));
+
         // Compute rate as sum of per-session deltas (stable across session churn).
         // Update prev_tokens in place; stale entries are harmless (bounded by
         // total unique sessions ever seen) and keeping them avoids false spikes
@@ -574,6 +606,13 @@ impl App {
 
         // Spawn summary jobs for sessions that need one
         for s in &self.sessions {
+            // OpenCode maintains its own session title; the generic
+            // `claude --print` summarizer would only summarize the
+            // placeholder. Skip it entirely.
+            if s.agent_cli == "opencode" {
+                continue;
+            }
+
             let retries = self
                 .summary_retries
                 .get(&s.session_id)
@@ -611,7 +650,8 @@ impl App {
     /// True if any session still qualifies for a summary retry.
     pub fn has_retryable_summaries(&self) -> bool {
         self.sessions.iter().any(|s| {
-            (!s.initial_prompt.is_empty() || !s.first_assistant_text.is_empty())
+            s.agent_cli != "opencode"
+                && (!s.initial_prompt.is_empty() || !s.first_assistant_text.is_empty())
                 && !self.summaries.contains_key(&s.session_id)
                 && !self.pending_summaries.contains(&s.session_id)
                 && self
@@ -805,6 +845,11 @@ impl App {
     /// Get the display summary for a session: LLM summary > "..." if pending > raw prompt > "—"
     /// Done sessions skip pending state to avoid stuck "..." display.
     pub fn session_summary(&self, session: &AgentSession) -> String {
+        // OpenCode generates its own session title via a background subagent;
+        // probe for the real title instead of surfacing a placeholder.
+        if session.agent_cli == "opencode" {
+            return self.opencode_summary(session);
+        }
         if let Some(summary) = self.summaries.get(&session.session_id) {
             summary.clone()
         } else if matches!(session.status, SessionStatus::Done) {
@@ -817,19 +862,7 @@ impl App {
                 "—".to_string()
             }
         } else if self.pending_summaries.contains(&session.session_id) {
-            // Animate dots: . → .. → ... (cycles every ~1.5s at 2s tick)
-            let dots = match (std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis()
-                / 500)
-                % 3
-            {
-                0 => ".",
-                1 => "..",
-                _ => "...",
-            };
-            dots.to_string()
+            self.pending_dots()
         } else if !session.initial_prompt.is_empty() {
             sanitize_fallback(&session.initial_prompt, 80)
         } else if !session.first_assistant_text.is_empty() {
@@ -838,6 +871,75 @@ impl App {
             "—".to_string()
         }
     }
+
+    /// Summary for an OpenCode session = its live DB title, with placeholder
+    /// suppression during the 10s/30s/60s title-generation probe window.
+    fn opencode_summary(&self, session: &AgentSession) -> String {
+        let title = &session.initial_prompt;
+        if !crate::collector::opencode::is_placeholder_title(title) {
+            // A real title has landed (picked up by the ~10s DB refresh).
+            return sanitize_fallback(title, 80);
+        }
+        // A finished session will never get a new title — surface the placeholder.
+        if matches!(session.status, SessionStatus::Done) {
+            return sanitize_fallback(title, 80);
+        }
+        // Placeholder and live: keep re-probing for the real title within the
+        // window instead of showing "New Session" / "Session Start".
+        let now_ms = unix_ms();
+        let first = self
+            .opencode_title_first_seen
+            .get(&session.session_id)
+            .copied()
+            .unwrap_or(now_ms);
+        if now_ms.saturating_sub(first) < OCO_TITLE_MAX_WAIT_MS {
+            return self.pending_dots();
+        }
+        // Title generation never produced a real title — surface what we have.
+        sanitize_fallback(title, 80)
+    }
+
+    /// The "task" line shown in the session detail header. For OpenCode,
+    /// `initial_prompt` is the session *title* (later generated by a
+    /// background subagent), so a placeholder title is suppressed (returns
+    /// `None`) until a real one lands — avoiding "New Session" /
+    /// "Session Start" in the detail panel.
+    pub fn session_task_line(&self, session: &AgentSession) -> Option<String> {
+        if session.initial_prompt.is_empty() {
+            return None;
+        }
+        if session.agent_cli == "opencode"
+            && crate::collector::opencode::is_placeholder_title(&session.initial_prompt)
+        {
+            return None;
+        }
+        Some(session.initial_prompt.clone())
+    }
+
+    /// Animated pending indicator: `.` → `..` → `...` (cycles every ~1.5s
+    /// at the 2s tick).
+    fn pending_dots(&self) -> String {
+        let dots = match (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            / 500)
+            % 3
+        {
+            0 => ".",
+            1 => "..",
+            _ => "...",
+        };
+        dots.to_string()
+    }
+}
+
+/// Current unix time in milliseconds.
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 /// Call `claude --print` via stdin pipe to summarize a prompt.
