@@ -120,21 +120,26 @@ impl OpenCodeCollector {
 
             let age_ms = now_ms.saturating_sub(ds.time_updated);
             let since_update_secs = age_ms / 1000;
-            let status = if since_update_secs < 30 {
+            // A running tool (a CPU-active child/descendant) is the definitive
+            // Executing signal. Evaluate it first so a recently-updated DB row
+            // (opencode writes `time_updated` on every message/tool activity,
+            // keeping `since_update_secs` well under 30s while working) can't
+            // lock the session into Thinking and mask real execution.
+            let cpu_active = proc.is_some_and(|p| p.cpu_pct > 1.0);
+            let has_active_child = process::has_active_descendant(
+                matched_pid,
+                &shared.children_map,
+                &shared.process_info,
+                5.0,
+            );
+            let status = if has_active_child {
+                SessionStatus::Executing
+            } else if since_update_secs < 30 || cpu_active {
+                // Recently active, or the main process itself is busy (model
+                // generating a response / between turns).
                 SessionStatus::Thinking
             } else {
-                let cpu_active = proc.is_some_and(|p| p.cpu_pct > 1.0);
-                let has_active_child = process::has_active_descendant(
-                    matched_pid,
-                    &shared.children_map,
-                    &shared.process_info,
-                    5.0,
-                );
-                if cpu_active || has_active_child {
-                    SessionStatus::Thinking
-                } else {
-                    SessionStatus::Waiting
-                }
+                SessionStatus::Waiting
             };
 
             let project_name = if !ds.project_name.is_empty() {
@@ -146,10 +151,10 @@ impl OpenCodeCollector {
                     .to_string()
             };
 
-            let current_tasks = if matches!(status, SessionStatus::Waiting) {
-                vec!["waiting for input".to_string()]
-            } else {
-                vec!["thinking...".to_string()]
+            let current_tasks = match status {
+                SessionStatus::Waiting => vec!["waiting for input".to_string()],
+                SessionStatus::Executing => vec!["executing...".to_string()],
+                _ => vec!["thinking...".to_string()],
             };
 
             // Collect child processes with cycle guard (visited set)
